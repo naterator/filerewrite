@@ -1,16 +1,49 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"log"
 	"os"
 	"reflect"
+	"strings"
 	"syscall"
+
+	flag "github.com/spf13/pflag"
 )
 
 var verbose bool
 var bufferSizeMB int
+
+func normalizeGoStyleLongFlags(args []string, fs *flag.FlagSet) []string {
+	normalized := make([]string, 0, len(args))
+	for _, arg := range args {
+		// Keep literals and already-gnu-style options as-is.
+		if !strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "--") || arg == "-" {
+			normalized = append(normalized, arg)
+			continue
+		}
+		if len(arg) <= 2 {
+			normalized = append(normalized, arg)
+			continue
+		}
+
+		name := strings.TrimPrefix(arg, "-")
+		value := ""
+		if idx := strings.Index(name, "="); idx >= 0 {
+			value = name[idx:]
+			name = name[:idx]
+		}
+
+		// If this matches a defined long flag name, promote to --long.
+		if fs.Lookup(name) != nil {
+			normalized = append(normalized, "--"+name+value)
+			continue
+		}
+
+		normalized = append(normalized, arg)
+	}
+	return normalized
+}
 
 func logWarning(format string, args ...any) {
 	log.Printf(format, args...)
@@ -116,20 +149,35 @@ func rewriteFile(path string, bufferSizeBytes int) bool {
 }
 
 func main() {
-	flag.BoolVar(&verbose, "v", false, "enable verbose output")
-	flag.BoolVar(&verbose, "verbose", false, "enable verbose output")
-	flag.IntVar(&bufferSizeMB, "b", 8, "buffer size in MB")
-	flag.IntVar(&bufferSizeMB, "buffersize", 8, "buffer size in MB")
+	flag.BoolVarP(&verbose, "verbose", "v", false, "enable verbose output")
+	flag.IntVarP(&bufferSizeMB, "buffersize", "b", 8, "buffer size in MB")
 	help := false
-	flag.BoolVar(&help, "h", false, "show help")
-	flag.BoolVar(&help, "help", false, "show help")
+	flag.BoolVarP(&help, "help", "h", false, "show help")
 	flag.Usage = func() {
 		_, _ = fmt.Fprintf(flag.CommandLine.Output(), "Usage of %s:\n", os.Args[0])
 		_, _ = fmt.Fprintln(flag.CommandLine.Output(), "  filerewrite [flags] file ...")
-		flag.PrintDefaults()
+		flag.VisitAll(func(f *flag.Flag) {
+			typeName := ""
+			if f.Value.Type() != "bool" {
+				typeName = " " + f.Value.Type()
+			}
+
+			flagLabel := fmt.Sprintf("-%s%s", f.Name, typeName)
+			if f.Shorthand != "" {
+				flagLabel = fmt.Sprintf("-%s, -%s%s", f.Shorthand, f.Name, typeName)
+			}
+			_, _ = fmt.Fprintf(flag.CommandLine.Output(), "  %-24s %s", flagLabel, f.Usage)
+			if f.DefValue != "" && f.DefValue != "false" {
+				_, _ = fmt.Fprintf(flag.CommandLine.Output(), " (default %s)", f.DefValue)
+			}
+			_, _ = fmt.Fprintln(flag.CommandLine.Output())
+		})
 	}
 
-	flag.Parse()
+	normalizedArgs := normalizeGoStyleLongFlags(os.Args[1:], flag.CommandLine)
+	if err := flag.CommandLine.Parse(normalizedArgs); err != nil {
+		os.Exit(2)
+	}
 	if help {
 		flag.Usage()
 		os.Exit(0)

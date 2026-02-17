@@ -152,13 +152,16 @@ func TestCLIHelpShortFlag(t *testing.T) {
 	if !strings.Contains(stderr, "Usage of filerewrite:") {
 		t.Fatalf("help output missing usage header: %q", stderr)
 	}
-	if !strings.Contains(stderr, "-buffersize int") {
+	if !strings.Contains(stderr, "-b, -buffersize int") {
 		t.Fatalf("help output missing buffersize flag: %q", stderr)
+	}
+	if strings.Contains(stderr, "--buffersize") {
+		t.Fatalf("help output should not use double-dash long flags: %q", stderr)
 	}
 }
 
 func TestCLIHelpLongFlag(t *testing.T) {
-	exitCode, _, stderr := runCLI(t, "--help")
+	exitCode, _, stderr := runCLI(t, "-help")
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, want 0", exitCode)
 	}
@@ -198,7 +201,7 @@ func TestCLIVerboseLongFlag(t *testing.T) {
 		t.Fatalf("write file: %v", err)
 	}
 
-	exitCode, _, stderr := runCLI(t, "--verbose", path)
+	exitCode, _, stderr := runCLI(t, "-verbose", path)
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
@@ -225,9 +228,24 @@ func TestCLIBufferSizeLongFlag(t *testing.T) {
 		t.Fatalf("write file: %v", err)
 	}
 
-	exitCode, _, stderr := runCLI(t, "--buffersize", "1", path)
+	exitCode, _, stderr := runCLI(t, "-buffersize", "1", path)
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+}
+
+func TestCLILongFlagsStillSupportDoubleDash(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.txt")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), 4096), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	exitCode, _, stderr := runCLI(t, "--buffersize", "1", "--verbose", path)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "Rewriting "+path+"...") {
+		t.Fatalf("verbose output missing rewrite line: %q", stderr)
 	}
 }
 
