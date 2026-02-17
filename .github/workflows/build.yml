@@ -14,17 +14,21 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        goos: [linux, windows, darwin]
+        goos: [darwin, freebsd, linux, netbsd, openbsd]
         goarch: [amd64, arm64]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Build
         uses: wangyoucao577/go-release-action@v1
+        env:
+          CGO_ENABLED: 0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           goos: ${{ matrix.goos }}
           goarch: ${{ matrix.goarch }}
+          ldflags: -s -w
+          build_flags: -trimpath
           overwrite: true
           sha256sum: true
           md5sum: false

@@ -9,9 +9,8 @@ import (
 	"syscall"
 )
 
-const bufSize = 8 * 1024 * 1024
-
 var verbose bool
+var bufferSizeMB int
 
 func logWarning(format string, args ...any) {
 	log.Printf(format, args...)
@@ -47,8 +46,8 @@ func statTimes(sb *syscall.Stat_t) (syscall.Timespec, syscall.Timespec, bool) {
 	return syscall.Timespec{}, syscall.Timespec{}, false
 }
 
-func rewriteFile(path string) bool {
-	buf := make([]byte, bufSize)
+func rewriteFile(path string, bufferSizeBytes int) bool {
+	buf := make([]byte, bufferSizeBytes)
 	ret := false
 
 	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_NOFOLLOW, 0)
@@ -119,6 +118,8 @@ func rewriteFile(path string) bool {
 func main() {
 	flag.BoolVar(&verbose, "v", false, "enable verbose output")
 	flag.BoolVar(&verbose, "verbose", false, "enable verbose output")
+	flag.IntVar(&bufferSizeMB, "b", 8, "buffer size in MB")
+	flag.IntVar(&bufferSizeMB, "buffersize", 8, "buffer size in MB")
 	help := false
 	flag.BoolVar(&help, "h", false, "show help")
 	flag.BoolVar(&help, "help", false, "show help")
@@ -139,11 +140,17 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
+	if bufferSizeMB <= 0 {
+		logWarning("invalid buffer size %d MB: must be greater than 0", bufferSizeMB)
+		os.Exit(2)
+	}
+
+	bufferSizeBytes := bufferSizeMB * 1024 * 1024
 
 	ret := 0
 	for _, path := range args {
 		logVerbose("Rewriting %s...", path)
-		if !rewriteFile(path) {
+		if !rewriteFile(path, bufferSizeBytes) {
 			ret = 1
 		}
 	}
