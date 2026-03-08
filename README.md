@@ -4,7 +4,7 @@ A small utility that rewrites a file’s contents in-place.
 
 It opens each file in read-write mode, reads the data in chunks (default: 8 MB), and immediately writes those exact same bytes back to the same locations using `pread(2)` and `pwrite(2)`. After the rewrite is complete, it restores the original access and modification timestamps.
 
-Only regular files are rewritten. Paths that cannot be opened or rewritten, plus non-regular files such as symlinks and directories, are reported and contribute to a non-zero exit status. The tool does **not** try to detect or avoid rewriting the same data through hard links, so hard-linked files will be processed (and rewritten) multiple times.
+Only regular files are rewritten. Paths that cannot be opened or rewritten, plus non-regular files such as symlinks and directories, are reported and contribute to a non-zero exit status. By default, hard-linked files are processed once per path; with `--dedup-hardlinks`, later paths that point at the same device/inode pair are skipped without being treated as failures.
 
 ## Usage
 
@@ -16,16 +16,25 @@ filerewrite [flags] file ...
 
 - `-v`, `-verbose`, `--verbose`: Enable verbose logging.
 - `-b`, `-buffersize`, `--buffersize`: Rewrite buffer size in MB (default: `8`).
+- `-n`, `-dry-run`, `--dry-run`: Report files that would be rewritten without modifying them.
+- `-stats`, `--stats`: Print a one-line summary after processing.
+- `-dedup-hardlinks`, `--dedup-hardlinks`: Skip duplicate hard-linked files within a single invocation.
 - `-h`, `-help`, `--help`: Show help.
 
 The CLI accepts both Go-style single-dash long flags such as `-verbose` and GNU-style double-dash long flags such as `--verbose`.
 
 Buffer size must be greater than `0` and small enough to fit in the platform `int` range after conversion to bytes.
 
+## Reporting Modes
+
+- `--dry-run` prints `WOULD REWRITE <path>` for regular files that would be processed and does not open files for write access.
+- `--dry-run --dedup-hardlinks` prints `WOULD SKIP HARDLINK <path>` for later paths that reference the same inode as an earlier path in the same invocation.
+- `--stats` prints a summary line to `stderr` with path counts, failure counts, hard-link skips, and bytes rewritten.
+
 ## Exit Status
 
 - `0`: All requested files were rewritten successfully.
-- `1`: At least one path could not be rewritten.
+- `1`: At least one path could not be rewritten, was missing, or was not a regular file.
 - `2`: Invalid command-line usage, such as missing file arguments or an invalid buffer size.
 
 ## Primary Use Case
@@ -44,6 +53,18 @@ Use a larger buffer size, for example 64 MB:
 find /path/to/dataset -xdev -type f -print0 | xargs -0 filerewrite -b 64
 ```
 
+Preview what would be rewritten and print summary statistics:
+
+```bash
+find /path/to/dataset -xdev -type f -print0 | xargs -0 filerewrite --dry-run --stats
+```
+
+Avoid rewriting the same inode multiple times when the input includes hard links:
+
+```bash
+find /path/to/dataset -xdev -type f -print0 | xargs -0 filerewrite --dedup-hardlinks --stats
+```
+
 If any input path might begin with `-`, pass `--` before file arguments:
 
 ```bash
@@ -55,6 +76,6 @@ filerewrite [flags] -- file1 file2 ...
 - Do **not** run this on a live, in-use filesystem, since there’s an implicit read-write race that can corrupt data if anything modifies the file between the read and the write.
 - On ZFS filesystems that have snapshots, rewriting blocks likely doesn’t free any space until all snapshots that reference the old blocks are deleted. This applies to other similar facilities in ZFS that necessitate linking to additional data blocks.
 
-## Portability
+## License
 
-Should build and run on FreeBSD, Linux, and macOS. Other UNIX-like systems may need small platform-specific timestamp handling changes.
+[BSD 3-Clause License](LICENSE)

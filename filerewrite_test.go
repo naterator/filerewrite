@@ -231,6 +231,15 @@ func TestCLIHelpShortFlag(t *testing.T) {
 	if strings.Contains(stderr, "--buffersize") {
 		t.Fatalf("help output should not use double-dash long flags: %q", stderr)
 	}
+	if !strings.Contains(stderr, "-n, -dry-run") {
+		t.Fatalf("help output missing dry-run flag: %q", stderr)
+	}
+	if !strings.Contains(stderr, "-dedup-hardlinks") {
+		t.Fatalf("help output missing dedup-hardlinks flag: %q", stderr)
+	}
+	if !strings.Contains(stderr, "-stats") {
+		t.Fatalf("help output missing stats flag: %q", stderr)
+	}
 }
 
 func TestCLIHelpLongFlag(t *testing.T) {
@@ -380,6 +389,74 @@ func TestCLIInvalidBufferSize(t *testing.T) {
 	}
 }
 
+func TestCLIDryRunReportsWithoutChangingFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.bin")
+	original := bytes.Repeat([]byte("dry-run-test-"), 32)
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	atimeSet := time.Unix(1700001000, 111000000)
+	mtimeSet := time.Unix(1700002000, 222000000)
+	if err := os.Chtimes(path, atimeSet, mtimeSet); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	expectedAtime, expectedMtime := fileTimes(t, path)
+
+	exitCode, _, stderr := runCLI(t, "--dry-run", path)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "WOULD REWRITE "+path) {
+		t.Fatalf("dry-run output missing rewrite report: %q", stderr)
+	}
+
+	gotAtime, gotMtime := fileTimes(t, path)
+	if syscall.TimespecToNsec(gotAtime) != syscall.TimespecToNsec(expectedAtime) {
+		t.Fatalf("atime changed in dry-run: got=%d want=%d", syscall.TimespecToNsec(gotAtime), syscall.TimespecToNsec(expectedAtime))
+	}
+	if syscall.TimespecToNsec(gotMtime) != syscall.TimespecToNsec(expectedMtime) {
+		t.Fatalf("mtime changed in dry-run: got=%d want=%d", syscall.TimespecToNsec(gotMtime), syscall.TimespecToNsec(expectedMtime))
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file after dry-run: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("dry-run changed file data")
+	}
+}
+
+func TestCLIDryRunFailurePathsExitOne(t *testing.T) {
+	dir := t.TempDir()
+	regularPath := filepath.Join(dir, "data.txt")
+	missingPath := filepath.Join(dir, "missing.txt")
+	symlinkPath := filepath.Join(dir, "link.txt")
+	if err := os.WriteFile(regularPath, []byte("abc"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if err := os.Symlink(regularPath, symlinkPath); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
+
+	exitCode, _, stderr := runCLI(t, "--dry-run", regularPath, missingPath, symlinkPath)
+	if exitCode != 1 {
+		t.Fatalf("exit code = %d, want 1; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "WOULD REWRITE "+regularPath) {
+		t.Fatalf("dry-run output missing regular file report: %q", stderr)
+	}
+	if !strings.Contains(stderr, missingPath) {
+		t.Fatalf("dry-run output missing missing-file warning: %q", stderr)
+	}
+	if !strings.Contains(stderr, symlinkPath+" is not a regular file, skipping.") {
+		t.Fatalf("dry-run output missing non-regular warning: %q", stderr)
+	}
+}
+
 func TestCLIOversizedBufferSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data.txt")
 	if err := os.WriteFile(path, []byte("abc"), 0o644); err != nil {
@@ -395,6 +472,67 @@ func TestCLIOversizedBufferSize(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "exceeds platform limit") {
 		t.Fatalf("expected oversized buffer size warning, got: %q", stderr)
+	}
+}
+
+func TestCLIStatsSummary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.txt")
+	if err := os.WriteFile(path, []byte("abc"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	exitCode, _, stderr := runCLI(t, "--stats", path)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "Summary: paths=1 rewritten=1 would_rewrite=0 skipped_non_regular=0 skipped_hardlinks=0 failures=0 bytes_rewritten=3") {
+		t.Fatalf("stats summary missing or incorrect: %q", stderr)
+	}
+}
+
+func TestCLIDedupHardlinksDryRunWithStats(t *testing.T) {
+	dir := t.TempDir()
+	primaryPath := filepath.Join(dir, "primary.txt")
+	duplicatePath := filepath.Join(dir, "duplicate.txt")
+	if err := os.WriteFile(primaryPath, []byte("abc"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if err := os.Link(primaryPath, duplicatePath); err != nil {
+		t.Fatalf("create hard link: %v", err)
+	}
+
+	exitCode, _, stderr := runCLI(t, "--dry-run", "--dedup-hardlinks", "--stats", primaryPath, duplicatePath)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "WOULD REWRITE "+primaryPath) {
+		t.Fatalf("dry-run output missing primary rewrite report: %q", stderr)
+	}
+	if !strings.Contains(stderr, "WOULD SKIP HARDLINK "+duplicatePath) {
+		t.Fatalf("dry-run output missing hard-link skip report: %q", stderr)
+	}
+	if !strings.Contains(stderr, "Summary: paths=2 rewritten=0 would_rewrite=1 skipped_non_regular=0 skipped_hardlinks=1 failures=0 bytes_rewritten=0") {
+		t.Fatalf("stats summary missing or incorrect: %q", stderr)
+	}
+}
+
+func TestCLIDedupHardlinksStats(t *testing.T) {
+	dir := t.TempDir()
+	primaryPath := filepath.Join(dir, "primary.txt")
+	duplicatePath := filepath.Join(dir, "duplicate.txt")
+	if err := os.WriteFile(primaryPath, []byte("abc"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if err := os.Link(primaryPath, duplicatePath); err != nil {
+		t.Fatalf("create hard link: %v", err)
+	}
+
+	exitCode, _, stderr := runCLI(t, "--dedup-hardlinks", "--stats", primaryPath, duplicatePath)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "Summary: paths=2 rewritten=1 would_rewrite=0 skipped_non_regular=0 skipped_hardlinks=1 failures=0 bytes_rewritten=3") {
+		t.Fatalf("stats summary missing or incorrect: %q", stderr)
 	}
 }
 
@@ -421,5 +559,22 @@ func TestCLIMixedResultsExitOne(t *testing.T) {
 	}
 	if !bytes.Equal(got, original) {
 		t.Fatalf("valid file data changed")
+	}
+}
+
+func TestCLIStatsMixedResults(t *testing.T) {
+	dir := t.TempDir()
+	validPath := filepath.Join(dir, "data.txt")
+	missingPath := filepath.Join(dir, "missing.txt")
+	if err := os.WriteFile(validPath, []byte("abc"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	exitCode, _, stderr := runCLI(t, "--stats", validPath, missingPath)
+	if exitCode != 1 {
+		t.Fatalf("exit code = %d, want 1; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "Summary: paths=2 rewritten=1 would_rewrite=0 skipped_non_regular=0 skipped_hardlinks=0 failures=1 bytes_rewritten=3") {
+		t.Fatalf("stats summary missing or incorrect: %q", stderr)
 	}
 }
