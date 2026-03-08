@@ -7,10 +7,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	flag "github.com/spf13/pflag"
 )
 
 func TestMain(m *testing.M) {
@@ -76,6 +79,43 @@ func fileTimes(t *testing.T, path string) (syscall.Timespec, syscall.Timespec) {
 	return atime, mtime
 }
 
+func TestNormalizeGoStyleLongFlags(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.Bool("verbose", false, "")
+	fs.Int("buffersize", 8, "")
+
+	got := normalizeGoStyleLongFlags([]string{
+		"-buffersize=1",
+		"-verbose=false",
+		"--verbose",
+		"-unknown",
+		"--",
+		"-file",
+		"-",
+		"plain",
+	}, fs)
+
+	want := []string{
+		"--buffersize=1",
+		"--verbose=false",
+		"--verbose",
+		"-unknown",
+		"--",
+		"-file",
+		"-",
+		"plain",
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("normalizeGoStyleLongFlags length = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("normalizeGoStyleLongFlags[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestRewriteFilePreservesDataAndTimestamps(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "data.bin")
@@ -111,6 +151,39 @@ func TestRewriteFilePreservesDataAndTimestamps(t *testing.T) {
 	}
 	if !bytes.Equal(got, original) {
 		t.Fatalf("rewritten file data changed")
+	}
+}
+
+func TestRewriteFileCompletesShortWrites(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.bin")
+
+	original := bytes.Repeat([]byte("short-write-regression-"), 32)
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	originalPwrite := pwriteFile
+	pwriteFile = func(fd int, buf []byte, offset int64) (int, error) {
+		if len(buf) > 3 {
+			buf = buf[:3]
+		}
+		return originalPwrite(fd, buf, offset)
+	}
+	t.Cleanup(func() {
+		pwriteFile = originalPwrite
+	})
+
+	if ok := rewriteFile(path, 11); !ok {
+		t.Fatalf("rewriteFile returned false")
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read rewritten file: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("rewritten file data changed after short writes")
 	}
 }
 
@@ -234,6 +307,18 @@ func TestCLIBufferSizeLongFlag(t *testing.T) {
 	}
 }
 
+func TestCLIBufferSizeLongFlagWithEquals(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.txt")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), 4096), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	exitCode, _, stderr := runCLI(t, "-buffersize=1", path)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+}
+
 func TestCLILongFlagsStillSupportDoubleDash(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data.txt")
 	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), 4096), 0o644); err != nil {
@@ -241,6 +326,37 @@ func TestCLILongFlagsStillSupportDoubleDash(t *testing.T) {
 	}
 
 	exitCode, _, stderr := runCLI(t, "--buffersize", "1", "--verbose", path)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "Rewriting "+path+"...") {
+		t.Fatalf("verbose output missing rewrite line: %q", stderr)
+	}
+}
+
+func TestCLIBooleanLongFlagSupportsExplicitFalse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.txt")
+	if err := os.WriteFile(path, []byte("abc"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	exitCode, _, stderr := runCLI(t, "-verbose=false", path)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if strings.Contains(stderr, "Rewriting "+path+"...") {
+		t.Fatalf("verbose output should be disabled, got: %q", stderr)
+	}
+}
+
+func TestCLIEndOfFlagsAllowsDashPrefixedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "-data.txt")
+	if err := os.WriteFile(path, []byte("abc"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	exitCode, _, stderr := runCLI(t, "-v", "--", path)
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
@@ -261,5 +377,49 @@ func TestCLIInvalidBufferSize(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "invalid buffer size 0 MB") {
 		t.Fatalf("expected invalid buffer size warning, got: %q", stderr)
+	}
+}
+
+func TestCLIOversizedBufferSize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data.txt")
+	if err := os.WriteFile(path, []byte("abc"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	maxIntValue := int(^uint(0) >> 1)
+	tooLarge := maxIntValue/bytesPerMB + 1
+
+	exitCode, _, stderr := runCLI(t, "-b", strconv.Itoa(tooLarge), path)
+	if exitCode != 2 {
+		t.Fatalf("exit code = %d, want 2; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "exceeds platform limit") {
+		t.Fatalf("expected oversized buffer size warning, got: %q", stderr)
+	}
+}
+
+func TestCLIMixedResultsExitOne(t *testing.T) {
+	dir := t.TempDir()
+	validPath := filepath.Join(dir, "data.txt")
+	missingPath := filepath.Join(dir, "missing.txt")
+	original := []byte("abc")
+	if err := os.WriteFile(validPath, original, 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	exitCode, _, stderr := runCLI(t, validPath, missingPath)
+	if exitCode != 1 {
+		t.Fatalf("exit code = %d, want 1; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, missingPath) {
+		t.Fatalf("missing file warning not reported: %q", stderr)
+	}
+
+	got, err := os.ReadFile(validPath)
+	if err != nil {
+		t.Fatalf("read valid file: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("valid file data changed")
 	}
 }

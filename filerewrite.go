@@ -14,6 +14,29 @@ import (
 var verbose bool
 var bufferSizeMB int
 
+const bytesPerMB = 1024 * 1024
+
+var (
+	openFile = func(path string, mode int, perm uint32) (int, error) {
+		return syscall.Open(path, mode, perm)
+	}
+	closeFile = func(fd int) error {
+		return syscall.Close(fd)
+	}
+	fstatFile = func(fd int, sb *syscall.Stat_t) error {
+		return syscall.Fstat(fd, sb)
+	}
+	preadFile = func(fd int, buf []byte, offset int64) (int, error) {
+		return syscall.Pread(fd, buf, offset)
+	}
+	pwriteFile = func(fd int, buf []byte, offset int64) (int, error) {
+		return syscall.Pwrite(fd, buf, offset)
+	}
+	futimesFile = func(fd int, tv []syscall.Timeval) error {
+		return syscall.Futimes(fd, tv)
+	}
+)
+
 func normalizeGoStyleLongFlags(args []string, fs *flag.FlagSet) []string {
 	normalized := make([]string, 0, len(args))
 	for _, arg := range args {
@@ -79,19 +102,38 @@ func statTimes(sb *syscall.Stat_t) (syscall.Timespec, syscall.Timespec, bool) {
 	return syscall.Timespec{}, syscall.Timespec{}, false
 }
 
+func bufferSizeBytesFromMB(sizeMB int) (int, error) {
+	if sizeMB <= 0 {
+		return 0, fmt.Errorf("invalid buffer size %d MB: must be greater than 0", sizeMB)
+	}
+
+	maxIntValue := int(^uint(0) >> 1)
+	maxBufferSizeMB := maxIntValue / bytesPerMB
+	if sizeMB > maxBufferSizeMB {
+		return 0, fmt.Errorf("invalid buffer size %d MB: exceeds platform limit", sizeMB)
+	}
+
+	return sizeMB * bytesPerMB, nil
+}
+
 func rewriteFile(path string, bufferSizeBytes int) bool {
+	if bufferSizeBytes <= 0 {
+		logWarning("invalid rewrite buffer size %d bytes: must be greater than 0", bufferSizeBytes)
+		return false
+	}
+
 	buf := make([]byte, bufferSizeBytes)
 	ret := false
 
-	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_NOFOLLOW, 0)
+	fd, err := openFile(path, syscall.O_RDWR|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		logWarningWithError(err, "Unable to open %s", path)
 		return false
 	}
-	defer syscall.Close(fd)
+	defer closeFile(fd)
 
 	var sb syscall.Stat_t
-	if err := syscall.Fstat(fd, &sb); err != nil {
+	if err := fstatFile(fd, &sb); err != nil {
 		logWarningWithError(err, "Unable to stat %s", path)
 		return false
 	}
@@ -102,7 +144,7 @@ func rewriteFile(path string, bufferSizeBytes int) bool {
 
 	var offset int64
 	for {
-		rdone, err := syscall.Pread(fd, buf, offset)
+		rdone, err := preadFile(fd, buf, offset)
 		if err != nil {
 			logWarningWithError(err, "Read from %s at offset %d failed", path, offset)
 			return false
@@ -112,21 +154,29 @@ func rewriteFile(path string, bufferSizeBytes int) bool {
 		}
 		logVerbose("Read %d from %s at offset %d.", rdone, path, offset)
 
-		wdone, err := syscall.Pwrite(fd, buf[:rdone], offset)
-		if err != nil {
-			logWarningWithError(err, "Write %s at offset %d failed", path, offset)
-			return false
-		}
-		if wdone == 0 {
-			logWarning("Wrote nothing to %s at offset %d.", path, offset)
-			return false
-		}
-		logVerbose("Wrote %d to %s at offset %d.", wdone, path, offset)
-		if wdone < rdone {
-			logWarning("Short write to %s at offset %d (wrote %d instead of %d).", path, offset, wdone, rdone)
+		written := 0
+		for written < rdone {
+			writeOffset := offset + int64(written)
+			remaining := rdone - written
+
+			wdone, err := pwriteFile(fd, buf[written:rdone], writeOffset)
+			if err != nil {
+				logWarningWithError(err, "Write %s at offset %d failed", path, writeOffset)
+				return false
+			}
+			if wdone == 0 {
+				logWarning("Wrote nothing to %s at offset %d.", path, writeOffset)
+				return false
+			}
+			logVerbose("Wrote %d to %s at offset %d.", wdone, path, writeOffset)
+			if wdone < remaining {
+				logWarning("Short write to %s at offset %d (wrote %d instead of %d).", path, writeOffset, wdone, remaining)
+			}
+
+			written += wdone
 		}
 
-		offset += int64(wdone)
+		offset += int64(rdone)
 	}
 
 	atime, mtime, ok := statTimes(&sb)
@@ -138,7 +188,7 @@ func rewriteFile(path string, bufferSizeBytes int) bool {
 		syscall.NsecToTimeval(syscall.TimespecToNsec(atime)),
 		syscall.NsecToTimeval(syscall.TimespecToNsec(mtime)),
 	}
-	if err := syscall.Futimes(fd, tv); err != nil {
+	if err := futimesFile(fd, tv); err != nil {
 		logWarningWithError(err, "Unable to restore access and modification times on %s", path)
 		return false
 	}
@@ -188,12 +238,11 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
-	if bufferSizeMB <= 0 {
-		logWarning("invalid buffer size %d MB: must be greater than 0", bufferSizeMB)
+	bufferSizeBytes, err := bufferSizeBytesFromMB(bufferSizeMB)
+	if err != nil {
+		logWarning("%v", err)
 		os.Exit(2)
 	}
-
-	bufferSizeBytes := bufferSizeMB * 1024 * 1024
 
 	ret := 0
 	for _, path := range args {

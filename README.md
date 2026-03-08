@@ -4,7 +4,7 @@ A small utility that rewrites a file’s contents in-place.
 
 It opens each file in read-write mode, reads the data in chunks (default: 8 MB), and immediately writes those exact same bytes back to the same locations using `pread(2)` and `pwrite(2)`. After the rewrite is complete, it restores the original access and modification timestamps.
 
-The tool only processes regular files — symlinks, directories, etc. are skipped. It does **not** try to detect or avoid rewriting the same data through hard links, so hard-linked files will be processed (and rewritten) multiple times.
+Only regular files are rewritten. Paths that cannot be opened or rewritten, plus non-regular files such as symlinks and directories, are reported and contribute to a non-zero exit status. The tool does **not** try to detect or avoid rewriting the same data through hard links, so hard-linked files will be processed (and rewritten) multiple times.
 
 ## Usage
 
@@ -14,11 +14,19 @@ filerewrite [flags] file ...
 
 ### Flags
 
-- `-v`, `-verbose`: Enable verbose logging.
-- `-b`, `-buffersize`: Rewrite buffer size in MB (default: `8`).
-- `-h`, `-help`: Show help.
+- `-v`, `-verbose`, `--verbose`: Enable verbose logging.
+- `-b`, `-buffersize`, `--buffersize`: Rewrite buffer size in MB (default: `8`).
+- `-h`, `-help`, `--help`: Show help.
 
-Buffer size must be greater than `0`.
+The CLI accepts both Go-style single-dash long flags such as `-verbose` and GNU-style double-dash long flags such as `--verbose`.
+
+Buffer size must be greater than `0` and small enough to fit in the platform `int` range after conversion to bytes.
+
+## Exit Status
+
+- `0`: All requested files were rewritten successfully.
+- `1`: At least one path could not be rewritten.
+- `2`: Invalid command-line usage, such as missing file arguments or an invalid buffer size.
 
 ## Primary Use Case
 
@@ -49,4 +57,4 @@ filerewrite [flags] -- file1 file2 ...
 
 ## Portability
 
-Should build and run without issues on FreeBSD, Linux, macOS, and most other modern UNIX-like systems.
+Should build and run on FreeBSD, Linux, and macOS. Other UNIX-like systems may need small platform-specific timestamp handling changes.
