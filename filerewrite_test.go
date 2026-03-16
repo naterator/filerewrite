@@ -1,9 +1,9 @@
+//go:build linux || darwin || freebsd
+
 package main
 
 import (
 	"bytes"
-	"io"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,18 +16,20 @@ import (
 	flag "github.com/spf13/pflag"
 )
 
-func TestMain(m *testing.M) {
-	log.SetFlags(0)
-	log.SetOutput(io.Discard)
-	os.Exit(m.Run())
+func runCLI(t *testing.T, args ...string) (int, string, string) {
+	t.Helper()
+	return runCLIInDir(t, "", args...)
 }
 
-func runCLI(t *testing.T, args ...string) (int, string, string) {
+func runCLIInDir(t *testing.T, dir string, args ...string) (int, string, string) {
 	t.Helper()
 
 	cmdArgs := append([]string{"-test.run=TestCLIMainHelper", "--"}, args...)
 	cmd := exec.Command(os.Args[0], cmdArgs...)
 	cmd.Env = append(os.Environ(), "GO_WANT_HELPER_PROCESS=1")
+	if dir != "" {
+		cmd.Dir = dir
+	}
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -49,9 +51,6 @@ func TestCLIMainHelper(t *testing.T) {
 	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
 		return
 	}
-
-	log.SetFlags(0)
-	log.SetOutput(os.Stderr)
 
 	args := []string{"filerewrite"}
 	for i := 0; i < len(os.Args); i++ {
@@ -125,8 +124,8 @@ func TestRewriteFilePreservesDataAndTimestamps(t *testing.T) {
 		t.Fatalf("write file: %v", err)
 	}
 
-	atimeSet := time.Unix(1700000000, 123000000)
-	mtimeSet := time.Unix(1700000100, 456000000)
+	atimeSet := time.Unix(1700000000, 123456789)
+	mtimeSet := time.Unix(1700000100, 456789123)
 	if err := os.Chtimes(path, atimeSet, mtimeSet); err != nil {
 		t.Fatalf("chtimes: %v", err)
 	}
@@ -234,11 +233,17 @@ func TestCLIHelpShortFlag(t *testing.T) {
 	if !strings.Contains(stderr, "-n, -dry-run") {
 		t.Fatalf("help output missing dry-run flag: %q", stderr)
 	}
+	if !strings.Contains(stderr, "-autoupdate") {
+		t.Fatalf("help output missing autoupdate flag: %q", stderr)
+	}
 	if !strings.Contains(stderr, "-dedup-hardlinks") {
 		t.Fatalf("help output missing dedup-hardlinks flag: %q", stderr)
 	}
 	if !strings.Contains(stderr, "-stats") {
 		t.Fatalf("help output missing stats flag: %q", stderr)
+	}
+	if !strings.Contains(stderr, "-version") {
+		t.Fatalf("help output missing version flag: %q", stderr)
 	}
 }
 
@@ -259,6 +264,19 @@ func TestCLINoArgsExitsWithUsage(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "Usage of filerewrite:") {
 		t.Fatalf("usage output missing: %q", stderr)
+	}
+}
+
+func TestCLIVersionFlag(t *testing.T) {
+	exitCode, stdout, stderr := runCLI(t, "-version")
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stdout != appVersion+"\n" {
+		t.Fatalf("stdout = %q, want %q", stdout, appVersion+"\\n")
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty", stderr)
 	}
 }
 
@@ -374,6 +392,22 @@ func TestCLIEndOfFlagsAllowsDashPrefixedFile(t *testing.T) {
 	}
 }
 
+func TestCLIEndOfFlagsAllowsFlagShapedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "-verbose")
+	if err := os.WriteFile(path, []byte("abc"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	exitCode, _, stderr := runCLIInDir(t, dir, "--dry-run", "--", "-verbose")
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "WOULD REWRITE -verbose\n" {
+		t.Fatalf("stderr = %q, want %q", stderr, "WOULD REWRITE -verbose\\n")
+	}
+}
+
 func TestCLIInvalidBufferSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data.txt")
 	if err := os.WriteFile(path, []byte("abc"), 0o644); err != nil {
@@ -409,8 +443,8 @@ func TestCLIDryRunReportsWithoutChangingFile(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
-	if !strings.Contains(stderr, "WOULD REWRITE "+path) {
-		t.Fatalf("dry-run output missing rewrite report: %q", stderr)
+	if stderr != "WOULD REWRITE "+path+"\n" {
+		t.Fatalf("dry-run output = %q, want %q", stderr, "WOULD REWRITE "+path+"\\n")
 	}
 
 	gotAtime, gotMtime := fileTimes(t, path)

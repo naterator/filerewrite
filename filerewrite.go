@@ -1,8 +1,11 @@
+//go:build linux || darwin || freebsd
+
 package main
 
 import (
+	"context"
 	"fmt"
-	"log"
+	"io"
 	"os"
 	"strings"
 	"syscall"
@@ -11,9 +14,6 @@ import (
 )
 
 var verbose bool
-var bufferSizeMB int
-
-const bytesPerMB = 1024 * 1024
 
 var (
 	openFile = func(path string, mode int, perm uint32) (int, error) {
@@ -34,9 +34,8 @@ var (
 	pwriteFile = func(fd int, buf []byte, offset int64) (int, error) {
 		return syscall.Pwrite(fd, buf, offset)
 	}
-	futimesFile = func(fd int, tv []syscall.Timeval) error {
-		return syscall.Futimes(fd, tv)
-	}
+	infoOutput  io.Writer = os.Stderr
+	errorOutput io.Writer = os.Stderr
 )
 
 type pathOutcome int
@@ -76,9 +75,31 @@ type hardLinkKey struct {
 	ino uint64
 }
 
+type cliOptions struct {
+	verbose         bool
+	bufferSizeMB    int
+	dryRun          bool
+	stats           bool
+	dedupHardlinks  bool
+	help            bool
+	autoupdate      bool
+	showVersionOnly bool
+}
+
 func normalizeGoStyleLongFlags(args []string, fs *flag.FlagSet) []string {
 	normalized := make([]string, 0, len(args))
+	passthrough := false
 	for _, arg := range args {
+		if passthrough {
+			normalized = append(normalized, arg)
+			continue
+		}
+		if arg == "--" {
+			normalized = append(normalized, arg)
+			passthrough = true
+			continue
+		}
+
 		// Keep literals and already-gnu-style options as-is.
 		if !strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "--") || arg == "-" {
 			normalized = append(normalized, arg)
@@ -107,24 +128,31 @@ func normalizeGoStyleLongFlags(args []string, fs *flag.FlagSet) []string {
 	return normalized
 }
 
+func writeLine(w io.Writer, format string, args ...any) {
+	if w == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(w, format+"\n", args...)
+}
+
 func logWarning(format string, args ...any) {
-	log.Printf(format, args...)
+	writeLine(errorOutput, format, args...)
 }
 
 func logInfo(format string, args ...any) {
-	log.Printf(format, args...)
+	writeLine(infoOutput, format, args...)
 }
 
 func logWarningWithError(err error, format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	log.Printf("%s: %v.", msg, err)
+	writeLine(errorOutput, "%s: %v.", msg, err)
 }
 
 func logVerbose(format string, args ...any) {
 	if !verbose {
 		return
 	}
-	log.Printf(format, args...)
+	writeLine(errorOutput, format, args...)
 }
 
 func bufferSizeBytesFromMB(sizeMB int) (int, error) {
@@ -216,7 +244,7 @@ func rewriteOpenFile(fd int, path string, bufferSizeBytes int, sb *syscall.Stat_
 		logWarning("Unable to restore access and modification times on %s: unsupported stat timestamp fields.", path)
 		return pathResult{path: path, outcome: pathOutcomeFailed}
 	}
-	if err := restoreFileTimes(fd, atime, mtime); err != nil {
+	if err := restoreFileTimes(path, atime, mtime); err != nil {
 		logWarningWithError(err, "Unable to restore access and modification times on %s", path)
 		return pathResult{path: path, outcome: pathOutcomeFailed}
 	}
@@ -324,21 +352,25 @@ func rewriteFile(path string, bufferSizeBytes int) bool {
 	return processPath(path, processOptions{bufferSizeBytes: bufferSizeBytes}, nil).outcome == pathOutcomeRewritten
 }
 
-func main() {
-	flag.BoolVarP(&verbose, "verbose", "v", false, "enable verbose output")
-	flag.IntVarP(&bufferSizeMB, "buffersize", "b", 8, "buffer size in MB")
-	dryRun := false
-	flag.BoolVarP(&dryRun, "dry-run", "n", false, "report files that would be rewritten without modifying them")
-	stats := false
-	flag.BoolVar(&stats, "stats", false, "print summary statistics after processing")
-	dedupHardlinks := false
-	flag.BoolVar(&dedupHardlinks, "dedup-hardlinks", false, "skip duplicate hard-linked files within a single run")
-	help := false
-	flag.BoolVarP(&help, "help", "h", false, "show help")
-	flag.Usage = func() {
-		_, _ = fmt.Fprintf(flag.CommandLine.Output(), "Usage of %s:\n", os.Args[0])
-		_, _ = fmt.Fprintln(flag.CommandLine.Output(), "  filerewrite [flags] file ...")
-		flag.VisitAll(func(f *flag.Flag) {
+func newFlagSet(stderr io.Writer) (*flag.FlagSet, *cliOptions) {
+	options := &cliOptions{
+		bufferSizeMB: 8,
+	}
+
+	fs := flag.NewFlagSet(appName, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.BoolVarP(&options.verbose, "verbose", "v", false, "enable verbose output")
+	fs.IntVarP(&options.bufferSizeMB, "buffersize", "b", 8, "buffer size in MB")
+	fs.BoolVarP(&options.dryRun, "dry-run", "n", false, "report files that would be rewritten without modifying them")
+	fs.BoolVar(&options.stats, "stats", false, "print summary statistics after processing")
+	fs.BoolVar(&options.dedupHardlinks, "dedup-hardlinks", false, "skip duplicate hard-linked files within a single run")
+	fs.BoolVar(&options.autoupdate, "autoupdate", false, "check for updates and replace this executable if a newer release is available")
+	fs.BoolVar(&options.showVersionOnly, "version", false, "show the current version")
+	fs.BoolVarP(&options.help, "help", "h", false, "show help")
+	fs.Usage = func() {
+		_, _ = fmt.Fprintf(fs.Output(), "Usage of %s:\n", appName)
+		_, _ = fmt.Fprintf(fs.Output(), "  %s [flags] file ...\n", appName)
+		fs.VisitAll(func(f *flag.Flag) {
 			typeName := ""
 			if f.Value.Type() != "bool" {
 				typeName = " " + f.Value.Type()
@@ -348,60 +380,92 @@ func main() {
 			if f.Shorthand != "" {
 				flagLabel = fmt.Sprintf("-%s, -%s%s", f.Shorthand, f.Name, typeName)
 			}
-			_, _ = fmt.Fprintf(flag.CommandLine.Output(), "  %-24s %s", flagLabel, f.Usage)
+			_, _ = fmt.Fprintf(fs.Output(), "  %-24s %s", flagLabel, f.Usage)
 			if f.DefValue != "" && f.DefValue != "false" {
-				_, _ = fmt.Fprintf(flag.CommandLine.Output(), " (default %s)", f.DefValue)
+				_, _ = fmt.Fprintf(fs.Output(), " (default %s)", f.DefValue)
 			}
-			_, _ = fmt.Fprintln(flag.CommandLine.Output())
+			_, _ = fmt.Fprintln(fs.Output())
 		})
 	}
+	return fs, options
+}
 
-	normalizedArgs := normalizeGoStyleLongFlags(os.Args[1:], flag.CommandLine)
-	if err := flag.CommandLine.Parse(normalizedArgs); err != nil {
-		os.Exit(2)
+func run(args []string, stdout, stderr io.Writer) int {
+	verbose = false
+	if stdout == nil {
+		stdout = io.Discard
 	}
-	if help {
-		flag.Usage()
-		os.Exit(0)
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	infoOutput = stderr
+	errorOutput = stderr
+
+	fs, cli := newFlagSet(stderr)
+	normalizedArgs := normalizeGoStyleLongFlags(args, fs)
+
+	if err := fs.Parse(normalizedArgs); err != nil {
+		return 2
 	}
 
-	args := flag.Args()
-	if len(args) == 0 {
-		flag.Usage()
-		os.Exit(2)
+	verbose = cli.verbose
+	if cli.help {
+		fs.Usage()
+		return 0
 	}
-	bufferSizeBytes, err := bufferSizeBytesFromMB(bufferSizeMB)
+	if cli.autoupdate {
+		if err := makeReleaseUpdater().Run(context.Background(), appVersion, stdout); err != nil {
+			_, _ = fmt.Fprintf(stderr, "autoupdate failed: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if cli.showVersionOnly {
+		_, _ = fmt.Fprintln(stdout, appVersion)
+		return 0
+	}
+
+	paths := fs.Args()
+	if len(paths) == 0 {
+		fs.Usage()
+		return 2
+	}
+	bufferSizeBytes, err := bufferSizeBytesFromMB(cli.bufferSizeMB)
 	if err != nil {
 		logWarning("%v", err)
-		os.Exit(2)
+		return 2
 	}
 
-	options := processOptions{
+	process := processOptions{
 		bufferSizeBytes: bufferSizeBytes,
-		dryRun:          dryRun,
-		dedupHardlinks:  dedupHardlinks,
+		dryRun:          cli.dryRun,
+		dedupHardlinks:  cli.dedupHardlinks,
 	}
 	seenHardLinks := make(map[hardLinkKey]string)
 	run := runStats{}
 
 	ret := 0
-	for _, path := range args {
-		if options.dryRun {
+	for _, path := range paths {
+		if process.dryRun {
 			logVerbose("Inspecting %s...", path)
 		} else {
 			logVerbose("Rewriting %s...", path)
 		}
 
-		result := processPath(path, options, seenHardLinks)
+		result := processPath(path, process, seenHardLinks)
 		run.add(result)
 		if result.outcome == pathOutcomeFailed || result.outcome == pathOutcomeRejectedNonRegular {
 			ret = 1
 		}
 	}
 
-	if stats {
+	if cli.stats {
 		logInfo("%s", run.summaryLine())
 	}
 
-	os.Exit(ret)
+	return ret
+}
+
+func main() {
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
