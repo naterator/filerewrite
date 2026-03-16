@@ -1,11 +1,11 @@
-//go:build darwin || freebsd || netbsd
+//go:build openbsd
 
 package main
 
 import "syscall"
 
 func statTimes(sb *syscall.Stat_t) (syscall.Timespec, syscall.Timespec, bool) {
-	return sb.Atimespec, sb.Mtimespec, true
+	return sb.Atim, sb.Mtim, true
 }
 
 func restoreFileTimes(path string, atime, mtime syscall.Timespec) error {

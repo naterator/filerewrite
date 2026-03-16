@@ -6,7 +6,7 @@ It opens each file in read-write mode, reads the data in chunks (default: 8 MB),
 
 Only regular files are rewritten. Paths that cannot be opened or rewritten, plus non-regular files such as symlinks and directories, are reported and contribute to a non-zero exit status. By default, hard-linked files are processed once per path; with `--dedup-hardlinks`, later paths that point at the same device/inode pair are skipped without being treated as failures.
 
-Supported operating systems: Linux, macOS, and FreeBSD.
+Supported operating systems: Linux, macOS, FreeBSD, NetBSD, and OpenBSD.
 
 ## Usage
 
