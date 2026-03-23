@@ -18,7 +18,7 @@ jobs:
         goarch: [amd64, arm64]
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
       - name: Build
         uses: wangyoucao577/go-release-action@v1
         env:
@@ -27,7 +27,7 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           goos: ${{ matrix.goos }}
           goarch: ${{ matrix.goarch }}
-          ldflags: -s -w
+          ldflags: -s -w -X main.appVersion=${{ github.ref_name }}
           build_flags: -trimpath
           overwrite: true
           sha256sum: true

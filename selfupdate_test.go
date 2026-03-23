@@ -61,14 +61,14 @@ func testResponse(req *http.Request, statusCode int, body []byte) *http.Response
 	}
 }
 
-func TestCLIAutoupdateRunsUpdater(t *testing.T) {
+func TestCLISelfupdateRunsUpdater(t *testing.T) {
 	stub := &stubReleaseUpdater{}
 	withReleaseUpdaterStub(t, stub)
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	exitCode := run([]string{"-autoupdate", "-buffersize=0", "ignored-path"}, &stdout, &stderr)
+	exitCode := run([]string{"--selfupdate", "--buffersize=0", "ignored-path"}, &stdout, &stderr)
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
 	}
@@ -83,21 +83,21 @@ func TestCLIAutoupdateRunsUpdater(t *testing.T) {
 	}
 }
 
-func TestCLIAutoupdateReportsUpdaterError(t *testing.T) {
+func TestCLISelfupdateReportsUpdaterError(t *testing.T) {
 	stub := &stubReleaseUpdater{err: io.EOF}
 	withReleaseUpdaterStub(t, stub)
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
-	exitCode := run([]string{"-autoupdate"}, &stdout, &stderr)
+	exitCode := run([]string{"--selfupdate"}, &stdout, &stderr)
 	if exitCode != 1 {
 		t.Fatalf("exit code = %d, want 1", exitCode)
 	}
 	if stub.runCalls != 1 {
 		t.Fatalf("stub updater runCalls = %d, want 1", stub.runCalls)
 	}
-	if !strings.Contains(stderr.String(), "autoupdate failed: EOF") {
+	if !strings.Contains(stderr.String(), "selfupdate failed: EOF") {
 		t.Fatalf("stderr = %q", stderr.String())
 	}
 }
@@ -247,6 +247,49 @@ func TestGitHubReleaseUpdaterSkipsCurrentVersion(t *testing.T) {
 	}
 }
 
+func TestGitHubReleaseUpdaterSkipsNewerThanLatest(t *testing.T) {
+	var downloadCalls int
+	baseURL := "https://example.test"
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/repos/naterator/filerewrite/releases/latest":
+			body, err := json.Marshal(githubRelease{
+				TagName: "v1.0.0",
+				Assets:  []githubReleaseAsset{},
+			})
+			if err != nil {
+				t.Fatalf("Marshal returned error: %v", err)
+			}
+			return testResponse(r, http.StatusOK, body), nil
+		default:
+			downloadCalls++
+			t.Fatalf("unexpected download path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})
+
+	updater := &githubReleaseUpdater{
+		client:           client,
+		latestReleaseURL: baseURL + "/repos/naterator/filerewrite/releases/latest",
+		executablePath: func() (string, error) {
+			return "/unused", nil
+		},
+		goos:   runtime.GOOS,
+		goarch: runtime.GOARCH,
+	}
+
+	var stdout bytes.Buffer
+	if err := updater.Run(context.Background(), "2.0.0", &stdout); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if downloadCalls != 0 {
+		t.Fatalf("unexpected download calls: %d", downloadCalls)
+	}
+	if !strings.Contains(stdout.String(), "newer than published release") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
 func TestGitHubReleaseUpdaterRejectsChecksumMismatch(t *testing.T) {
 	exePath := filepath.Join(t.TempDir(), appName)
 	if err := os.WriteFile(exePath, []byte("old-binary"), 0o755); err != nil {
@@ -322,10 +365,24 @@ func TestParseSHA256FilePrefersNamedAsset(t *testing.T) {
 	}
 }
 
+func TestParseSHA256FileBSDFormatMatchesByName(t *testing.T) {
+	checksum, err := parseSHA256File(strings.Join([]string{
+		"SHA256 (other) = " + strings.Repeat("a", 64),
+		"SHA256 (wanted) = " + strings.Repeat("b", 64),
+	}, "\n"), "wanted")
+	if err != nil {
+		t.Fatalf("parseSHA256File returned error: %v", err)
+	}
+	if checksum != strings.Repeat("b", 64) {
+		t.Fatalf("checksum = %q, want %q", checksum, strings.Repeat("b", 64))
+	}
+}
+
 func TestParseSHA256FileRejectsMultipleUnnamedDigests(t *testing.T) {
+	// Use bare "KEY= hash" lines with no parenthesized filename.
 	_, err := parseSHA256File(strings.Join([]string{
-		"SHA256(file1)= " + strings.Repeat("a", 64),
-		"SHA256(file2)= " + strings.Repeat("b", 64),
+		"hash= " + strings.Repeat("a", 64),
+		"hash= " + strings.Repeat("b", 64),
 	}, "\n"), "wanted")
 	if err == nil {
 		t.Fatal("parseSHA256File unexpectedly succeeded")
@@ -344,6 +401,9 @@ func TestNormalizeSemver(t *testing.T) {
 	}{
 		{name: "plain", input: "1.2.3", want: "v1.2.3"},
 		{name: "prefixed", input: "v1.2.3", want: "v1.2.3"},
+		{name: "leading zeros", input: "v01.02.03", want: "v1.2.3"},
+		{name: "all zeros", input: "v0.0.0", want: "v0.0.0"},
+		{name: "leading zeros major only", input: "v010.0.1", want: "v10.0.1"},
 		{name: "missing patch", input: "1.2", wantErr: true},
 		{name: "prerelease", input: "v1.2.3-rc1", wantErr: true},
 		{name: "empty", input: "", wantErr: true},
@@ -363,6 +423,37 @@ func TestNormalizeSemver(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("normalizeSemver(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCompareSemver(t *testing.T) {
+	testCases := []struct {
+		name string
+		a, b string
+		want int
+	}{
+		{name: "equal", a: "v1.2.3", b: "v1.2.3", want: 0},
+		{name: "major greater", a: "v2.0.0", b: "v1.9.9", want: 1},
+		{name: "major less", a: "v1.9.9", b: "v2.0.0", want: -1},
+		{name: "minor greater", a: "v1.3.0", b: "v1.2.9", want: 1},
+		{name: "minor less", a: "v1.2.9", b: "v1.3.0", want: -1},
+		{name: "patch greater", a: "v1.2.4", b: "v1.2.3", want: 1},
+		{name: "patch less", a: "v1.2.3", b: "v1.2.4", want: -1},
+		{name: "double digit major", a: "v10.0.0", b: "v9.0.0", want: 1},
+		{name: "double digit minor", a: "v1.10.0", b: "v1.9.0", want: 1},
+		{name: "double digit patch", a: "v1.0.10", b: "v1.0.9", want: 1},
+		{name: "minor 10 vs 2", a: "v1.10.0", b: "v1.2.0", want: 1},
+		{name: "minor 2 vs 1", a: "v1.2.0", b: "v1.1.0", want: 1},
+		{name: "minor 1 vs 10", a: "v1.1.0", b: "v1.10.0", want: -1},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := compareSemver(tc.a, tc.b)
+			if got != tc.want {
+				t.Fatalf("compareSemver(%q, %q) = %d, want %d", tc.a, tc.b, got, tc.want)
 			}
 		})
 	}

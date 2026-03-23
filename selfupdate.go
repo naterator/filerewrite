@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -152,7 +153,7 @@ func (u *githubReleaseUpdater) fetchChecksum(ctx context.Context, checksumURL, b
 
 func (u *githubReleaseUpdater) downloadAndReplace(ctx context.Context, exePath, assetURL, expectedChecksum string) error {
 	if strings.EqualFold(u.goos, "windows") {
-		return fmt.Errorf("autoupdate is not supported on windows yet")
+		return fmt.Errorf("selfupdate is not supported on windows yet")
 	}
 
 	info, err := os.Stat(exePath)
@@ -161,15 +162,18 @@ func (u *githubReleaseUpdater) downloadAndReplace(ctx context.Context, exePath, 
 	}
 
 	dir := filepath.Dir(exePath)
-	tempFile, err := os.CreateTemp(dir, "."+appName+"-autoupdate-*")
+	tempFile, err := os.CreateTemp(dir, "."+appName+"-selfupdate-*")
 	if err != nil {
 		return fmt.Errorf("create temporary download file: %w", err)
 	}
 
 	tempPath := tempFile.Name()
+	tempClosed := false
 	removeTemp := true
 	defer func() {
-		_ = tempFile.Close()
+		if !tempClosed {
+			_ = tempFile.Close()
+		}
 		if removeTemp {
 			_ = os.Remove(tempPath)
 		}
@@ -191,6 +195,7 @@ func (u *githubReleaseUpdater) downloadAndReplace(ctx context.Context, exePath, 
 	if err := tempFile.Close(); err != nil {
 		return fmt.Errorf("close downloaded release asset: %w", err)
 	}
+	tempClosed = true
 
 	actualChecksum := hex.EncodeToString(hash.Sum(nil))
 	if !strings.EqualFold(actualChecksum, expectedChecksum) {
@@ -328,7 +333,13 @@ func parseSHA256Line(line string) (string, string, bool) {
 	if idx := strings.LastIndex(line, "="); idx >= 0 {
 		candidate := strings.TrimSpace(line[idx+1:])
 		if isHexSHA256(candidate) {
-			return strings.ToLower(candidate), "", true
+			name := ""
+			if open := strings.Index(line[:idx], "("); open >= 0 {
+				if close := strings.Index(line[open:idx], ")"); close >= 0 {
+					name = line[open+1 : open+close]
+				}
+			}
+			return strings.ToLower(candidate), name, true
 		}
 	}
 
@@ -371,7 +382,7 @@ func normalizeSemver(version string) (string, error) {
 	if len(parts) != 3 {
 		return "", fmt.Errorf("version must use vMAJOR.MINOR.PATCH")
 	}
-	for _, part := range parts {
+	for i, part := range parts {
 		if part == "" {
 			return "", fmt.Errorf("version must use vMAJOR.MINOR.PATCH")
 		}
@@ -380,22 +391,25 @@ func normalizeSemver(version string) (string, error) {
 				return "", fmt.Errorf("version must use vMAJOR.MINOR.PATCH")
 			}
 		}
+		// Strip leading zeros to produce a canonical form.
+		parts[i] = strings.TrimLeft(part, "0")
+		if parts[i] == "" {
+			parts[i] = "0"
+		}
 	}
-	return version, nil
+	return "v" + strings.Join(parts, "."), nil
 }
 
 func compareSemver(a, b string) int {
 	aParts := strings.Split(strings.TrimPrefix(a, "v"), ".")
 	bParts := strings.Split(strings.TrimPrefix(b, "v"), ".")
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
+		ai, _ := strconv.Atoi(aParts[i])
+		bi, _ := strconv.Atoi(bParts[i])
 		switch {
-		case len(aParts[i]) > len(bParts[i]):
+		case ai > bi:
 			return 1
-		case len(aParts[i]) < len(bParts[i]):
-			return -1
-		case aParts[i] > bParts[i]:
-			return 1
-		case aParts[i] < bParts[i]:
+		case ai < bi:
 			return -1
 		}
 	}

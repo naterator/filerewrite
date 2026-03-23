@@ -8,6 +8,43 @@ Only regular files are rewritten. Paths that cannot be opened or rewritten, plus
 
 Supported operating systems: Linux, macOS, FreeBSD, NetBSD, and OpenBSD.
 
+## Installation
+
+### Pre-built binaries
+
+Download a binary from the [latest GitHub release](https://github.com/naterator/filerewrite/releases/latest). Binaries are available for all supported OS/architecture combinations (`linux`, `darwin`, `freebsd`, `netbsd`, `openbsd` × `amd64`, `arm64`).
+
+```bash
+# Example: Linux amd64
+curl -L -o filerewrite https://github.com/naterator/filerewrite/releases/latest/download/filerewrite-linux-amd64
+chmod +x filerewrite
+sudo mv filerewrite /usr/local/bin/
+```
+
+Each release asset includes a `.sha256` checksum file for verification.
+
+### From source
+
+```bash
+go install github.com/naterator/filerewrite@latest
+```
+
+Or clone and build manually:
+
+```bash
+git clone https://github.com/naterator/filerewrite.git
+cd filerewrite
+go build -ldflags "-s -w" -trimpath
+```
+
+### Self-update
+
+An existing installation can update itself to the latest release:
+
+```bash
+filerewrite --selfupdate
+```
+
 ## Usage
 
 ```bash
@@ -16,16 +53,14 @@ filerewrite [flags] file ...
 
 ### Flags
 
-- `-v`, `-verbose`, `--verbose`: Enable verbose logging.
-- `-b`, `-buffersize`, `--buffersize`: Rewrite buffer size in MB (default: `8`).
-- `-n`, `-dry-run`, `--dry-run`: Report files that would be rewritten without modifying them.
-- `-stats`, `--stats`: Print a one-line summary after processing.
-- `-dedup-hardlinks`, `--dedup-hardlinks`: Skip duplicate hard-linked files within a single invocation.
-- `-autoupdate`, `--autoupdate`: Check GitHub releases for a newer version and replace the current executable. When this flag is present, all other command-line parameters are ignored.
-- `-version`, `--version`: Print the current version and exit.
-- `-h`, `-help`, `--help`: Show help.
-
-The CLI accepts both Go-style single-dash long flags such as `-verbose` and GNU-style double-dash long flags such as `--verbose`.
+- `-v`, `--verbose`: Enable verbose logging.
+- `-b`, `--buffersize`: Rewrite buffer size in MB (default: `8`).
+- `-n`, `--dry-run`: Report files that would be rewritten without modifying them.
+- `--stats`: Print a one-line summary after processing.
+- `--dedup-hardlinks`: Skip duplicate hard-linked files within a single invocation.
+- `--selfupdate`: Check GitHub releases for a newer version and replace the current executable. When this flag is present, all other command-line parameters are ignored.
+- `--version`: Print the current version and exit.
+- `-h`, `--help`: Show help.
 
 Buffer size must be greater than `0` and small enough to fit in the platform `int` range after conversion to bytes.
 
@@ -33,7 +68,10 @@ Buffer size must be greater than `0` and small enough to fit in the platform `in
 
 - `--dry-run` prints a plain `WOULD REWRITE <path>` line to `stderr` for regular files that would be processed and does not open files for write access.
 - `--dry-run --dedup-hardlinks` prints a plain `WOULD SKIP HARDLINK <path>` line to `stderr` for later paths that reference the same inode as an earlier path in the same invocation.
-- `--stats` prints a plain summary line to `stderr` with path counts, failure counts, hard-link skips, and bytes rewritten.
+- `--stats` prints a plain summary line to `stderr`:
+  ```
+  Summary: paths=5 rewritten=4 would_rewrite=0 skipped_non_regular=0 skipped_hardlinks=1 failures=0 bytes_rewritten=10485760
+  ```
 
 ## Exit Status
 

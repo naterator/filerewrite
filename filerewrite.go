@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"syscall"
 
 	flag "github.com/spf13/pflag"
@@ -82,50 +81,8 @@ type cliOptions struct {
 	stats           bool
 	dedupHardlinks  bool
 	help            bool
-	autoupdate      bool
+	selfupdate      bool
 	showVersionOnly bool
-}
-
-func normalizeGoStyleLongFlags(args []string, fs *flag.FlagSet) []string {
-	normalized := make([]string, 0, len(args))
-	passthrough := false
-	for _, arg := range args {
-		if passthrough {
-			normalized = append(normalized, arg)
-			continue
-		}
-		if arg == "--" {
-			normalized = append(normalized, arg)
-			passthrough = true
-			continue
-		}
-
-		// Keep literals and already-gnu-style options as-is.
-		if !strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "--") || arg == "-" {
-			normalized = append(normalized, arg)
-			continue
-		}
-		if len(arg) <= 2 {
-			normalized = append(normalized, arg)
-			continue
-		}
-
-		name := strings.TrimPrefix(arg, "-")
-		value := ""
-		if idx := strings.Index(name, "="); idx >= 0 {
-			value = name[idx:]
-			name = name[:idx]
-		}
-
-		// If this matches a defined long flag name, promote to --long.
-		if fs.Lookup(name) != nil {
-			normalized = append(normalized, "--"+name+value)
-			continue
-		}
-
-		normalized = append(normalized, arg)
-	}
-	return normalized
 }
 
 func writeLine(w io.Writer, format string, args ...any) {
@@ -364,7 +321,7 @@ func newFlagSet(stderr io.Writer) (*flag.FlagSet, *cliOptions) {
 	fs.BoolVarP(&options.dryRun, "dry-run", "n", false, "report files that would be rewritten without modifying them")
 	fs.BoolVar(&options.stats, "stats", false, "print summary statistics after processing")
 	fs.BoolVar(&options.dedupHardlinks, "dedup-hardlinks", false, "skip duplicate hard-linked files within a single run")
-	fs.BoolVar(&options.autoupdate, "autoupdate", false, "check for updates and replace this executable if a newer release is available")
+	fs.BoolVar(&options.selfupdate, "selfupdate", false, "check for updates and replace this executable if a newer release is available")
 	fs.BoolVar(&options.showVersionOnly, "version", false, "show the current version")
 	fs.BoolVarP(&options.help, "help", "h", false, "show help")
 	fs.Usage = func() {
@@ -376,9 +333,9 @@ func newFlagSet(stderr io.Writer) (*flag.FlagSet, *cliOptions) {
 				typeName = " " + f.Value.Type()
 			}
 
-			flagLabel := fmt.Sprintf("-%s%s", f.Name, typeName)
+			flagLabel := fmt.Sprintf("--%s%s", f.Name, typeName)
 			if f.Shorthand != "" {
-				flagLabel = fmt.Sprintf("-%s, -%s%s", f.Shorthand, f.Name, typeName)
+				flagLabel = fmt.Sprintf("-%s, --%s%s", f.Shorthand, f.Name, typeName)
 			}
 			_, _ = fmt.Fprintf(fs.Output(), "  %-24s %s", flagLabel, f.Usage)
 			if f.DefValue != "" && f.DefValue != "false" {
@@ -402,9 +359,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	errorOutput = stderr
 
 	fs, cli := newFlagSet(stderr)
-	normalizedArgs := normalizeGoStyleLongFlags(args, fs)
 
-	if err := fs.Parse(normalizedArgs); err != nil {
+	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
@@ -413,9 +369,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fs.Usage()
 		return 0
 	}
-	if cli.autoupdate {
+	if cli.selfupdate {
 		if err := makeReleaseUpdater().Run(context.Background(), appVersion, stdout); err != nil {
-			_, _ = fmt.Fprintf(stderr, "autoupdate failed: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "selfupdate failed: %v\n", err)
 			return 1
 		}
 		return 0
