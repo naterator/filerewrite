@@ -19,6 +19,8 @@ import (
 
 const githubLatestReleaseURL = "https://api.github.com/repos/naterator/filerewrite/releases/latest"
 
+const executableModeMask = os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+
 type releaseUpdater interface {
 	Run(ctx context.Context, currentVersion string, stdout io.Writer) error
 }
@@ -43,6 +45,13 @@ type githubReleaseAsset struct {
 
 var makeReleaseUpdater = newDefaultReleaseUpdater
 
+var (
+	createTempFile = os.CreateTemp
+	chmodPath      = os.Chmod
+	renamePath     = os.Rename
+	removePath     = os.Remove
+)
+
 func newDefaultReleaseUpdater() releaseUpdater {
 	return &githubReleaseUpdater{
 		client: &http.Client{
@@ -53,6 +62,14 @@ func newDefaultReleaseUpdater() releaseUpdater {
 		goos:             runtime.GOOS,
 		goarch:           runtime.GOARCH,
 	}
+}
+
+func replacementExecutableMode(mode os.FileMode) os.FileMode {
+	preserved := mode & executableModeMask
+	if preserved&os.ModePerm == 0 {
+		preserved |= 0o755
+	}
+	return preserved
 }
 
 func (u *githubReleaseUpdater) Run(ctx context.Context, currentVersion string, stdout io.Writer) error {
@@ -162,7 +179,7 @@ func (u *githubReleaseUpdater) downloadAndReplace(ctx context.Context, exePath, 
 	}
 
 	dir := filepath.Dir(exePath)
-	tempFile, err := os.CreateTemp(dir, "."+appName+"-selfupdate-*")
+	tempFile, err := createTempFile(dir, "."+appName+"-selfupdate-*")
 	if err != nil {
 		return fmt.Errorf("create temporary download file: %w", err)
 	}
@@ -175,7 +192,7 @@ func (u *githubReleaseUpdater) downloadAndReplace(ctx context.Context, exePath, 
 			_ = tempFile.Close()
 		}
 		if removeTemp {
-			_ = os.Remove(tempPath)
+			_ = removePath(tempPath)
 		}
 	}()
 
@@ -202,15 +219,12 @@ func (u *githubReleaseUpdater) downloadAndReplace(ctx context.Context, exePath, 
 		return fmt.Errorf("checksum mismatch for downloaded binary: got %s want %s", actualChecksum, expectedChecksum)
 	}
 
-	mode := info.Mode().Perm()
-	if mode == 0 {
-		mode = 0o755
-	}
-	if err := os.Chmod(tempPath, mode); err != nil {
+	mode := replacementExecutableMode(info.Mode())
+	if err := chmodPath(tempPath, mode); err != nil {
 		return fmt.Errorf("mark downloaded binary executable: %w", err)
 	}
 
-	if err := os.Rename(tempPath, exePath); err != nil {
+	if err := renamePath(tempPath, exePath); err != nil {
 		return fmt.Errorf("replace current executable %q: %w", exePath, err)
 	}
 	removeTemp = false

@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -54,10 +55,27 @@ func newTestClient(fn roundTripFunc) *http.Client {
 func testResponse(req *http.Request, statusCode int, body []byte) *http.Response {
 	return &http.Response{
 		StatusCode: statusCode,
-		Status:     http.StatusText(statusCode),
+		Status:     fmt.Sprintf("%d %s", statusCode, http.StatusText(statusCode)),
 		Body:       io.NopCloser(bytes.NewReader(body)),
 		Header:     make(http.Header),
 		Request:    req,
+	}
+}
+
+func runtimeAssetNames(goos, goarch string) (string, string) {
+	binaryCandidates, checksumCandidates := releaseAssetCandidates(goos, goarch)
+	return binaryCandidates[0], checksumCandidates[0]
+}
+
+func newUpdaterForTest(client *http.Client, latestReleaseURL, exePath string, goos, goarch string) *githubReleaseUpdater {
+	return &githubReleaseUpdater{
+		client:           client,
+		latestReleaseURL: latestReleaseURL,
+		executablePath: func() (string, error) {
+			return exePath, nil
+		},
+		goos:   goos,
+		goarch: goarch,
 	}
 }
 
@@ -106,6 +124,10 @@ func TestGitHubReleaseUpdaterReplacesExecutable(t *testing.T) {
 	exePath := filepath.Join(t.TempDir(), appName)
 	if err := os.WriteFile(exePath, []byte("old-binary"), 0o755); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	expectedMode := os.FileMode(0o755) | os.ModeSetuid | os.ModeSetgid
+	if err := os.Chmod(exePath, expectedMode); err != nil {
+		t.Fatalf("Chmod returned error: %v", err)
 	}
 
 	binaryCandidates, checksumCandidates := releaseAssetCandidates(runtime.GOOS, runtime.GOARCH)
@@ -175,8 +197,8 @@ func TestGitHubReleaseUpdaterReplacesExecutable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat returned error: %v", err)
 	}
-	if info.Mode().Perm() != 0o755 {
-		t.Fatalf("updated executable mode = %#o, want 0755", info.Mode().Perm())
+	if got := info.Mode() & executableModeMask; got != expectedMode {
+		t.Fatalf("updated executable mode = %v, want %v", got, expectedMode)
 	}
 	if metadataCalls != 1 || binaryCalls != 1 || checksumCalls != 1 {
 		t.Fatalf("calls = metadata:%d binary:%d checksum:%d", metadataCalls, binaryCalls, checksumCalls)
@@ -186,6 +208,22 @@ func TestGitHubReleaseUpdaterReplacesExecutable(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "Updated "+appName+" to v9.9.9") {
 		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestReplacementExecutableModePreservesSpecialBits(t *testing.T) {
+	input := os.FileMode(0o751) | os.ModeSetuid | os.ModeSetgid | os.ModeSticky | os.ModeDir
+	want := os.FileMode(0o751) | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+	if got := replacementExecutableMode(input); got != want {
+		t.Fatalf("replacementExecutableMode(%v) = %v, want %v", input, got, want)
+	}
+}
+
+func TestReplacementExecutableModeFallsBackToExecutablePerms(t *testing.T) {
+	input := os.FileMode(0)
+	want := os.FileMode(0o755)
+	if got := replacementExecutableMode(input); got != want {
+		t.Fatalf("replacementExecutableMode(%v) = %v, want %v", input, got, want)
 	}
 }
 
@@ -341,6 +379,317 @@ func TestGitHubReleaseUpdaterRejectsChecksumMismatch(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "checksum mismatch") {
 		t.Fatalf("Run error = %v", err)
+	}
+
+	got, readErr := os.ReadFile(exePath)
+	if readErr != nil {
+		t.Fatalf("ReadFile returned error: %v", readErr)
+	}
+	if string(got) != "old-binary" {
+		t.Fatalf("executable content = %q, want old-binary", string(got))
+	}
+}
+
+func TestGitHubReleaseUpdaterRejectsMalformedReleaseMetadata(t *testing.T) {
+	exePath := filepath.Join(t.TempDir(), appName)
+	if err := os.WriteFile(exePath, []byte("old-binary"), 0o755); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	baseURL := "https://example.test"
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/repos/naterator/filerewrite/releases/latest":
+			return testResponse(r, http.StatusOK, []byte("{not-json")), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})
+
+	updater := newUpdaterForTest(client, baseURL+"/repos/naterator/filerewrite/releases/latest", exePath, runtime.GOOS, runtime.GOARCH)
+	err := updater.Run(context.Background(), "1.0.0", io.Discard)
+	if err == nil {
+		t.Fatal("Run unexpectedly succeeded")
+	}
+	if !strings.Contains(err.Error(), "decode latest release metadata") {
+		t.Fatalf("Run error = %v", err)
+	}
+
+	got, readErr := os.ReadFile(exePath)
+	if readErr != nil {
+		t.Fatalf("ReadFile returned error: %v", readErr)
+	}
+	if string(got) != "old-binary" {
+		t.Fatalf("executable content = %q, want old-binary", string(got))
+	}
+}
+
+func TestGitHubReleaseUpdaterRejectsMissingBinaryAsset(t *testing.T) {
+	baseURL := "https://example.test"
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/repos/naterator/filerewrite/releases/latest":
+			body, err := json.Marshal(githubRelease{
+				TagName: "v9.9.9",
+				Assets: []githubReleaseAsset{
+					{Name: "other.sha256", BrowserDownloadURL: baseURL + "/download/other.sha256"},
+				},
+			})
+			if err != nil {
+				t.Fatalf("Marshal returned error: %v", err)
+			}
+			return testResponse(r, http.StatusOK, body), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})
+
+	updater := newUpdaterForTest(client, baseURL+"/repos/naterator/filerewrite/releases/latest", "/unused", runtime.GOOS, runtime.GOARCH)
+	err := updater.Run(context.Background(), "1.0.0", io.Discard)
+	if err == nil {
+		t.Fatal("Run unexpectedly succeeded")
+	}
+	if !strings.Contains(err.Error(), "does not include a binary") {
+		t.Fatalf("Run error = %v", err)
+	}
+}
+
+func TestGitHubReleaseUpdaterRejectsMissingChecksumAsset(t *testing.T) {
+	binaryName, _ := runtimeAssetNames(runtime.GOOS, runtime.GOARCH)
+	baseURL := "https://example.test"
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/repos/naterator/filerewrite/releases/latest":
+			body, err := json.Marshal(githubRelease{
+				TagName: "v9.9.9",
+				Assets: []githubReleaseAsset{
+					{Name: binaryName, BrowserDownloadURL: baseURL + "/download/" + binaryName},
+				},
+			})
+			if err != nil {
+				t.Fatalf("Marshal returned error: %v", err)
+			}
+			return testResponse(r, http.StatusOK, body), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})
+
+	updater := newUpdaterForTest(client, baseURL+"/repos/naterator/filerewrite/releases/latest", "/unused", runtime.GOOS, runtime.GOARCH)
+	err := updater.Run(context.Background(), "1.0.0", io.Discard)
+	if err == nil {
+		t.Fatal("Run unexpectedly succeeded")
+	}
+	if !strings.Contains(err.Error(), "does not include a checksum") {
+		t.Fatalf("Run error = %v", err)
+	}
+}
+
+func TestGitHubReleaseUpdaterRejectsChecksumParseFailure(t *testing.T) {
+	binaryName, checksumName := runtimeAssetNames(runtime.GOOS, runtime.GOARCH)
+	baseURL := "https://example.test"
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/repos/naterator/filerewrite/releases/latest":
+			body, err := json.Marshal(githubRelease{
+				TagName: "v9.9.9",
+				Assets: []githubReleaseAsset{
+					{Name: binaryName, BrowserDownloadURL: baseURL + "/download/" + binaryName},
+					{Name: checksumName, BrowserDownloadURL: baseURL + "/download/" + checksumName},
+				},
+			})
+			if err != nil {
+				t.Fatalf("Marshal returned error: %v", err)
+			}
+			return testResponse(r, http.StatusOK, body), nil
+		case "/download/" + checksumName:
+			return testResponse(r, http.StatusOK, []byte("not-a-checksum-file\n")), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})
+
+	updater := newUpdaterForTest(client, baseURL+"/repos/naterator/filerewrite/releases/latest", "/unused", runtime.GOOS, runtime.GOARCH)
+	err := updater.Run(context.Background(), "1.0.0", io.Discard)
+	if err == nil {
+		t.Fatal("Run unexpectedly succeeded")
+	}
+	if !strings.Contains(err.Error(), "parse checksum asset") {
+		t.Fatalf("Run error = %v", err)
+	}
+}
+
+func TestGitHubReleaseUpdaterReportsHTTPStatusErrors(t *testing.T) {
+	baseURL := "https://example.test"
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/repos/naterator/filerewrite/releases/latest":
+			return testResponse(r, http.StatusBadGateway, []byte("upstream broke")), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})
+
+	updater := newUpdaterForTest(client, baseURL+"/repos/naterator/filerewrite/releases/latest", "/unused", runtime.GOOS, runtime.GOARCH)
+	err := updater.Run(context.Background(), "1.0.0", io.Discard)
+	if err == nil {
+		t.Fatal("Run unexpectedly succeeded")
+	}
+	if !strings.Contains(err.Error(), "GET "+baseURL+"/repos/naterator/filerewrite/releases/latest returned 502 Bad Gateway: upstream broke") {
+		t.Fatalf("Run error = %v", err)
+	}
+}
+
+func TestGitHubReleaseUpdaterCleansUpTempFileOnChmodFailure(t *testing.T) {
+	exePath := filepath.Join(t.TempDir(), appName)
+	if err := os.WriteFile(exePath, []byte("old-binary"), 0o755); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	binaryName, checksumName := runtimeAssetNames(runtime.GOOS, runtime.GOARCH)
+	binaryBody := []byte("new-binary-content")
+	sum := sha256.Sum256(binaryBody)
+	checksumBody := hex.EncodeToString(sum[:]) + "  " + binaryName + "\n"
+
+	baseURL := "https://example.test"
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/repos/naterator/filerewrite/releases/latest":
+			body, err := json.Marshal(githubRelease{
+				TagName: "v9.9.9",
+				Assets: []githubReleaseAsset{
+					{Name: binaryName, BrowserDownloadURL: baseURL + "/download/" + binaryName},
+					{Name: checksumName, BrowserDownloadURL: baseURL + "/download/" + checksumName},
+				},
+			})
+			if err != nil {
+				t.Fatalf("Marshal returned error: %v", err)
+			}
+			return testResponse(r, http.StatusOK, body), nil
+		case "/download/" + binaryName:
+			return testResponse(r, http.StatusOK, binaryBody), nil
+		case "/download/" + checksumName:
+			return testResponse(r, http.StatusOK, []byte(checksumBody)), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})
+
+	var tempPath string
+	savedCreateTemp := createTempFile
+	savedChmod := chmodPath
+	createTempFile = func(dir, pattern string) (*os.File, error) {
+		f, err := savedCreateTemp(dir, pattern)
+		if err == nil {
+			tempPath = f.Name()
+		}
+		return f, err
+	}
+	chmodPath = func(name string, mode os.FileMode) error {
+		return os.ErrPermission
+	}
+	t.Cleanup(func() {
+		createTempFile = savedCreateTemp
+		chmodPath = savedChmod
+	})
+
+	updater := newUpdaterForTest(client, baseURL+"/repos/naterator/filerewrite/releases/latest", exePath, runtime.GOOS, runtime.GOARCH)
+	err := updater.Run(context.Background(), "1.0.0", io.Discard)
+	if err == nil {
+		t.Fatal("Run unexpectedly succeeded")
+	}
+	if !strings.Contains(err.Error(), "mark downloaded binary executable") {
+		t.Fatalf("Run error = %v", err)
+	}
+	if tempPath == "" {
+		t.Fatal("temp path was not recorded")
+	}
+	if _, statErr := os.Stat(tempPath); !os.IsNotExist(statErr) {
+		t.Fatalf("temp file cleanup stat error = %v, want not exists", statErr)
+	}
+
+	got, readErr := os.ReadFile(exePath)
+	if readErr != nil {
+		t.Fatalf("ReadFile returned error: %v", readErr)
+	}
+	if string(got) != "old-binary" {
+		t.Fatalf("executable content = %q, want old-binary", string(got))
+	}
+}
+
+func TestGitHubReleaseUpdaterCleansUpTempFileOnRenameFailure(t *testing.T) {
+	exePath := filepath.Join(t.TempDir(), appName)
+	if err := os.WriteFile(exePath, []byte("old-binary"), 0o755); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+
+	binaryName, checksumName := runtimeAssetNames(runtime.GOOS, runtime.GOARCH)
+	binaryBody := []byte("new-binary-content")
+	sum := sha256.Sum256(binaryBody)
+	checksumBody := hex.EncodeToString(sum[:]) + "  " + binaryName + "\n"
+
+	baseURL := "https://example.test"
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/repos/naterator/filerewrite/releases/latest":
+			body, err := json.Marshal(githubRelease{
+				TagName: "v9.9.9",
+				Assets: []githubReleaseAsset{
+					{Name: binaryName, BrowserDownloadURL: baseURL + "/download/" + binaryName},
+					{Name: checksumName, BrowserDownloadURL: baseURL + "/download/" + checksumName},
+				},
+			})
+			if err != nil {
+				t.Fatalf("Marshal returned error: %v", err)
+			}
+			return testResponse(r, http.StatusOK, body), nil
+		case "/download/" + binaryName:
+			return testResponse(r, http.StatusOK, binaryBody), nil
+		case "/download/" + checksumName:
+			return testResponse(r, http.StatusOK, []byte(checksumBody)), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})
+
+	var tempPath string
+	savedCreateTemp := createTempFile
+	savedRename := renamePath
+	createTempFile = func(dir, pattern string) (*os.File, error) {
+		f, err := savedCreateTemp(dir, pattern)
+		if err == nil {
+			tempPath = f.Name()
+		}
+		return f, err
+	}
+	renamePath = func(oldPath, newPath string) error {
+		return os.ErrPermission
+	}
+	t.Cleanup(func() {
+		createTempFile = savedCreateTemp
+		renamePath = savedRename
+	})
+
+	updater := newUpdaterForTest(client, baseURL+"/repos/naterator/filerewrite/releases/latest", exePath, runtime.GOOS, runtime.GOARCH)
+	err := updater.Run(context.Background(), "1.0.0", io.Discard)
+	if err == nil {
+		t.Fatal("Run unexpectedly succeeded")
+	}
+	if !strings.Contains(err.Error(), "replace current executable") {
+		t.Fatalf("Run error = %v", err)
+	}
+	if tempPath == "" {
+		t.Fatal("temp path was not recorded")
+	}
+	if _, statErr := os.Stat(tempPath); !os.IsNotExist(statErr) {
+		t.Fatalf("temp file cleanup stat error = %v, want not exists", statErr)
 	}
 
 	got, readErr := os.ReadFile(exePath)

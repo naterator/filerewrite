@@ -33,6 +33,9 @@ var (
 	pwriteFile = func(fd int, buf []byte, offset int64) (int, error) {
 		return syscall.Pwrite(fd, buf, offset)
 	}
+	syncFile = func(fd int) error {
+		return syscall.Fsync(fd)
+	}
 	infoOutput  io.Writer = os.Stderr
 	errorOutput io.Writer = os.Stderr
 )
@@ -43,6 +46,7 @@ const (
 	pathOutcomeFailed pathOutcome = iota
 	pathOutcomeRejectedNonRegular
 	pathOutcomeSkippedHardlink
+	pathOutcomeSkippedSparse
 	pathOutcomeWouldRewrite
 	pathOutcomeRewritten
 )
@@ -51,6 +55,7 @@ type processOptions struct {
 	bufferSizeBytes int
 	dryRun          bool
 	dedupHardlinks  bool
+	skipSparse      bool
 }
 
 type pathResult struct {
@@ -65,6 +70,7 @@ type runStats struct {
 	wouldRewrite      int
 	skippedNonRegular int
 	skippedHardlinks  int
+	skippedSparse     int
 	failures          int
 	bytesRewritten    int64
 }
@@ -80,6 +86,7 @@ type cliOptions struct {
 	dryRun          bool
 	stats           bool
 	dedupHardlinks  bool
+	skipSparse      bool
 	help            bool
 	selfupdate      bool
 	showVersionOnly bool
@@ -151,6 +158,38 @@ func trackHardLink(path string, sb *syscall.Stat_t, seen map[hardLinkKey]string)
 	return "", false
 }
 
+func sameFileIdentity(a, b *syscall.Stat_t) bool {
+	return hardLinkKeyFromStat(a) == hardLinkKeyFromStat(b)
+}
+
+func allocatedFileBytes(sb *syscall.Stat_t) int64 {
+	if sb.Blocks <= 0 {
+		return 0
+	}
+	return sb.Blocks * 512
+}
+
+func isSparseFile(sb *syscall.Stat_t) bool {
+	return sb.Size > 0 && sb.Size > allocatedFileBytes(sb)
+}
+
+func closeProcessedFile(fd int, path string, result pathResult) pathResult {
+	if err := closeFile(fd); err != nil {
+		logWarningWithError(err, "Unable to close %s", path)
+		return pathResult{path: path, outcome: pathOutcomeFailed}
+	}
+	return result
+}
+
+func sparseSkipResult(path string, dryRun bool) pathResult {
+	if dryRun {
+		logInfo("WOULD SKIP SPARSE %s", path)
+	} else {
+		logInfo("SKIP SPARSE %s", path)
+	}
+	return pathResult{path: path, outcome: pathOutcomeSkippedSparse}
+}
+
 func rewriteOpenFile(fd int, path string, bufferSizeBytes int, sb *syscall.Stat_t) pathResult {
 	if bufferSizeBytes <= 0 {
 		logWarning("invalid rewrite buffer size %d bytes: must be greater than 0", bufferSizeBytes)
@@ -196,16 +235,27 @@ func rewriteOpenFile(fd int, path string, bufferSizeBytes int, sb *syscall.Stat_
 		offset += int64(rdone)
 	}
 
+	if err := syncFile(fd); err != nil {
+		logWarningWithError(err, "Unable to flush rewritten data on %s", path)
+		return pathResult{path: path, outcome: pathOutcomeFailed}
+	}
+	logVerbose("Flushed rewritten data on %s.", path)
+
 	atime, mtime, ok := statTimes(sb)
 	if !ok {
 		logWarning("Unable to restore access and modification times on %s: unsupported stat timestamp fields.", path)
 		return pathResult{path: path, outcome: pathOutcomeFailed}
 	}
-	if err := restoreFileTimes(path, atime, mtime); err != nil {
+	if err := restoreFileTimes(fd, atime, mtime); err != nil {
 		logWarningWithError(err, "Unable to restore access and modification times on %s", path)
 		return pathResult{path: path, outcome: pathOutcomeFailed}
 	}
 	logVerbose("Restored access and modification times on %s.", path)
+	if err := syncFile(fd); err != nil {
+		logWarningWithError(err, "Unable to flush restored timestamps on %s", path)
+		return pathResult{path: path, outcome: pathOutcomeFailed}
+	}
+	logVerbose("Flushed restored timestamps on %s.", path)
 
 	return pathResult{
 		path:           path,
@@ -235,6 +285,9 @@ func processPath(path string, options processOptions, seen map[hardLinkKey]strin
 	}
 
 	if options.dryRun {
+		if options.skipSparse && isSparseFile(&initialSB) {
+			return sparseSkipResult(path, true)
+		}
 		if options.dedupHardlinks {
 			if firstPath, duplicate := trackHardLink(path, &initialSB, seen); duplicate {
 				logInfo("WOULD SKIP HARDLINK %s (same inode as %s)", path, firstPath)
@@ -251,26 +304,33 @@ func processPath(path string, options processOptions, seen map[hardLinkKey]strin
 		logWarningWithError(err, "Unable to open %s", path)
 		return pathResult{path: path, outcome: pathOutcomeFailed}
 	}
-	defer closeFile(fd)
 
 	var openSB syscall.Stat_t
 	if err := fstatFile(fd, &openSB); err != nil {
 		logWarningWithError(err, "Unable to stat %s", path)
-		return pathResult{path: path, outcome: pathOutcomeFailed}
+		return closeProcessedFile(fd, path, pathResult{path: path, outcome: pathOutcomeFailed})
 	}
 	if !isRegularFile(uint32(openSB.Mode)) {
 		logWarning("%s is not a regular file, skipping.", path)
-		return pathResult{path: path, outcome: pathOutcomeRejectedNonRegular}
+		return closeProcessedFile(fd, path, pathResult{path: path, outcome: pathOutcomeRejectedNonRegular})
+	}
+	if !sameFileIdentity(&initialSB, &openSB) {
+		logWarning("%s changed identity between stat and open, skipping.", path)
+		return closeProcessedFile(fd, path, pathResult{path: path, outcome: pathOutcomeFailed})
+	}
+	if options.skipSparse && isSparseFile(&openSB) {
+		return closeProcessedFile(fd, path, sparseSkipResult(path, false))
 	}
 
 	if options.dedupHardlinks {
 		if firstPath, duplicate := trackHardLink(path, &openSB, seen); duplicate {
 			logVerbose("Skipping hard-link duplicate %s (same inode as %s).", path, firstPath)
-			return pathResult{path: path, outcome: pathOutcomeSkippedHardlink}
+			return closeProcessedFile(fd, path, pathResult{path: path, outcome: pathOutcomeSkippedHardlink})
 		}
 	}
 
-	return rewriteOpenFile(fd, path, options.bufferSizeBytes, &openSB)
+	rewriteResult := rewriteOpenFile(fd, path, options.bufferSizeBytes, &openSB)
+	return closeProcessedFile(fd, path, rewriteResult)
 }
 
 func (stats *runStats) add(result pathResult) {
@@ -284,6 +344,8 @@ func (stats *runStats) add(result pathResult) {
 		stats.wouldRewrite++
 	case pathOutcomeSkippedHardlink:
 		stats.skippedHardlinks++
+	case pathOutcomeSkippedSparse:
+		stats.skippedSparse++
 	case pathOutcomeRejectedNonRegular:
 		stats.skippedNonRegular++
 		stats.failures++
@@ -294,12 +356,13 @@ func (stats *runStats) add(result pathResult) {
 
 func (stats runStats) summaryLine() string {
 	return fmt.Sprintf(
-		"Summary: paths=%d rewritten=%d would_rewrite=%d skipped_non_regular=%d skipped_hardlinks=%d failures=%d bytes_rewritten=%d",
+		"Summary: paths=%d rewritten=%d would_rewrite=%d skipped_non_regular=%d skipped_hardlinks=%d skipped_sparse=%d failures=%d bytes_rewritten=%d",
 		stats.paths,
 		stats.rewritten,
 		stats.wouldRewrite,
 		stats.skippedNonRegular,
 		stats.skippedHardlinks,
+		stats.skippedSparse,
 		stats.failures,
 		stats.bytesRewritten,
 	)
@@ -321,6 +384,7 @@ func newFlagSet(stderr io.Writer) (*flag.FlagSet, *cliOptions) {
 	fs.BoolVarP(&options.dryRun, "dry-run", "n", false, "report files that would be rewritten without modifying them")
 	fs.BoolVar(&options.stats, "stats", false, "print summary statistics after processing")
 	fs.BoolVar(&options.dedupHardlinks, "dedup-hardlinks", false, "skip duplicate hard-linked files within a single run")
+	fs.BoolVar(&options.skipSparse, "skip-sparse", false, "skip files that appear sparse instead of rewriting them")
 	fs.BoolVar(&options.selfupdate, "selfupdate", false, "check for updates and replace this executable if a newer release is available")
 	fs.BoolVar(&options.showVersionOnly, "version", false, "show the current version")
 	fs.BoolVarP(&options.help, "help", "h", false, "show help")
@@ -396,6 +460,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		bufferSizeBytes: bufferSizeBytes,
 		dryRun:          cli.dryRun,
 		dedupHardlinks:  cli.dedupHardlinks,
+		skipSparse:      cli.skipSparse,
 	}
 	seenHardLinks := make(map[hardLinkKey]string)
 	run := runStats{}

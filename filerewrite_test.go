@@ -77,6 +77,48 @@ func fileTimes(t *testing.T, path string) (syscall.Timespec, syscall.Timespec) {
 	return atime, mtime
 }
 
+func markStatSparse(sb *syscall.Stat_t) {
+	if sb.Size == 0 {
+		sb.Size = 1
+	}
+	sb.Blocks = 0
+}
+
+func createSparseTestFile(t *testing.T, dir, name string) string {
+	t.Helper()
+
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatalf("write sparse placeholder: %v", err)
+	}
+	if err := os.Truncate(path, 1<<20); err != nil {
+		t.Fatalf("truncate sparse file: %v", err)
+	}
+
+	var sb syscall.Stat_t
+	if err := syscall.Stat(path, &sb); err != nil {
+		t.Fatalf("stat sparse file: %v", err)
+	}
+	if !isSparseFile(&sb) {
+		t.Skip("temp filesystem does not report sparse files")
+	}
+
+	return path
+}
+
+func TestIsSparseFile(t *testing.T) {
+	sparse := syscall.Stat_t{Size: 4096, Blocks: 8}
+	markStatSparse(&sparse)
+	if !isSparseFile(&sparse) {
+		t.Fatal("isSparseFile returned false for sparse-looking stat")
+	}
+
+	dense := syscall.Stat_t{Size: 4096, Blocks: 8}
+	if isSparseFile(&dense) {
+		t.Fatal("isSparseFile returned true for densely allocated stat")
+	}
+}
+
 func TestRewriteFilePreservesDataAndTimestamps(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "data.bin")
@@ -218,6 +260,157 @@ func TestRewriteFileMissingFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.txt")
 	if ok := rewriteFile(path, 1024); ok {
 		t.Fatalf("rewriteFile(missing file) = true, want false")
+	}
+}
+
+func TestRewriteFileRejectsPathSwapBetweenInspectAndOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.bin")
+	original := bytes.Repeat([]byte("path-swap-test-"), 32)
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	savedLstat := lstatFile
+	lstatFile = func(path string, sb *syscall.Stat_t) error {
+		if err := savedLstat(path, sb); err != nil {
+			return err
+		}
+		sb.Ino++
+		return nil
+	}
+	t.Cleanup(func() { lstatFile = savedLstat })
+
+	if ok := rewriteFile(path, 64); ok {
+		t.Fatalf("rewriteFile should have failed on path identity mismatch")
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("file content changed after path identity mismatch")
+	}
+}
+
+func TestRewriteFileFailsOnDataSyncError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.bin")
+	original := bytes.Repeat([]byte("data-sync-test-"), 32)
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	syncCalls := 0
+	savedSync := syncFile
+	syncFile = func(fd int) error {
+		syncCalls++
+		if syncCalls == 1 {
+			return syscall.EIO
+		}
+		return savedSync(fd)
+	}
+	t.Cleanup(func() { syncFile = savedSync })
+
+	if ok := rewriteFile(path, 64); ok {
+		t.Fatalf("rewriteFile should have failed on data sync error")
+	}
+	if syncCalls != 1 {
+		t.Fatalf("sync calls = %d, want 1", syncCalls)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("file content changed after data sync error")
+	}
+}
+
+func TestRewriteFileFailsOnTimestampSyncError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.bin")
+	original := bytes.Repeat([]byte("timestamp-sync-test-"), 32)
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	atimeSet := time.Unix(1700003000, 333000000)
+	mtimeSet := time.Unix(1700004000, 444000000)
+	if err := os.Chtimes(path, atimeSet, mtimeSet); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	expectedAtime, expectedMtime := fileTimes(t, path)
+
+	syncCalls := 0
+	savedSync := syncFile
+	syncFile = func(fd int) error {
+		syncCalls++
+		if syncCalls == 2 {
+			return syscall.EIO
+		}
+		return savedSync(fd)
+	}
+	t.Cleanup(func() { syncFile = savedSync })
+
+	if ok := rewriteFile(path, 64); ok {
+		t.Fatalf("rewriteFile should have failed on timestamp sync error")
+	}
+	if syncCalls != 2 {
+		t.Fatalf("sync calls = %d, want 2", syncCalls)
+	}
+
+	gotAtime, gotMtime := fileTimes(t, path)
+	if syscall.TimespecToNsec(gotAtime) != syscall.TimespecToNsec(expectedAtime) {
+		t.Fatalf("atime changed: got=%d want=%d", syscall.TimespecToNsec(gotAtime), syscall.TimespecToNsec(expectedAtime))
+	}
+	if syscall.TimespecToNsec(gotMtime) != syscall.TimespecToNsec(expectedMtime) {
+		t.Fatalf("mtime changed: got=%d want=%d", syscall.TimespecToNsec(gotMtime), syscall.TimespecToNsec(expectedMtime))
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("file content changed after timestamp sync error")
+	}
+}
+
+func TestRewriteFileFailsOnCloseError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.bin")
+	original := bytes.Repeat([]byte("close-error-test-"), 32)
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	closeCalls := 0
+	savedClose := closeFile
+	closeFile = func(fd int) error {
+		closeCalls++
+		if err := savedClose(fd); err != nil {
+			return err
+		}
+		return syscall.EIO
+	}
+	t.Cleanup(func() { closeFile = savedClose })
+
+	if ok := rewriteFile(path, 64); ok {
+		t.Fatalf("rewriteFile should have failed on close error")
+	}
+	if closeCalls != 1 {
+		t.Fatalf("close calls = %d, want 1", closeCalls)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("file content changed after close error")
 	}
 }
 
@@ -397,6 +590,9 @@ func TestCLIHelpShortFlag(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "--dedup-hardlinks") {
 		t.Fatalf("help output missing dedup-hardlinks flag: %q", stderr)
+	}
+	if !strings.Contains(stderr, "--skip-sparse") {
+		t.Fatalf("help output missing skip-sparse flag: %q", stderr)
 	}
 	if !strings.Contains(stderr, "--stats") {
 		t.Fatalf("help output missing stats flag: %q", stderr)
@@ -623,6 +819,19 @@ func TestCLIDryRunReportsWithoutChangingFile(t *testing.T) {
 	}
 }
 
+func TestCLIDryRunSkipSparseReportsSparseSkip(t *testing.T) {
+	dir := t.TempDir()
+	path := createSparseTestFile(t, dir, "sparse.img")
+
+	exitCode, _, stderr := runCLI(t, "--dry-run", "--skip-sparse", path)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if stderr != "WOULD SKIP SPARSE "+path+"\n" {
+		t.Fatalf("stderr = %q, want %q", stderr, "WOULD SKIP SPARSE "+path+"\\n")
+	}
+}
+
 func TestCLIDryRunFailurePathsExitOne(t *testing.T) {
 	dir := t.TempDir()
 	regularPath := filepath.Join(dir, "data.txt")
@@ -647,6 +856,22 @@ func TestCLIDryRunFailurePathsExitOne(t *testing.T) {
 	}
 	if !strings.Contains(stderr, symlinkPath+" is not a regular file, skipping.") {
 		t.Fatalf("dry-run output missing non-regular warning: %q", stderr)
+	}
+}
+
+func TestCLISkipSparseStats(t *testing.T) {
+	dir := t.TempDir()
+	path := createSparseTestFile(t, dir, "sparse.img")
+
+	exitCode, _, stderr := runCLI(t, "--skip-sparse", "--stats", path)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
+	}
+	if !strings.Contains(stderr, "SKIP SPARSE "+path) {
+		t.Fatalf("sparse skip output missing: %q", stderr)
+	}
+	if !strings.Contains(stderr, "Summary: paths=1 rewritten=0 would_rewrite=0 skipped_non_regular=0 skipped_hardlinks=0 skipped_sparse=1 failures=0 bytes_rewritten=0") {
+		t.Fatalf("stats summary missing or incorrect: %q", stderr)
 	}
 }
 
@@ -678,7 +903,7 @@ func TestCLIStatsSummary(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
-	if !strings.Contains(stderr, "Summary: paths=1 rewritten=1 would_rewrite=0 skipped_non_regular=0 skipped_hardlinks=0 failures=0 bytes_rewritten=3") {
+	if !strings.Contains(stderr, "Summary: paths=1 rewritten=1 would_rewrite=0 skipped_non_regular=0 skipped_hardlinks=0 skipped_sparse=0 failures=0 bytes_rewritten=3") {
 		t.Fatalf("stats summary missing or incorrect: %q", stderr)
 	}
 }
@@ -704,7 +929,7 @@ func TestCLIDedupHardlinksDryRunWithStats(t *testing.T) {
 	if !strings.Contains(stderr, "WOULD SKIP HARDLINK "+duplicatePath) {
 		t.Fatalf("dry-run output missing hard-link skip report: %q", stderr)
 	}
-	if !strings.Contains(stderr, "Summary: paths=2 rewritten=0 would_rewrite=1 skipped_non_regular=0 skipped_hardlinks=1 failures=0 bytes_rewritten=0") {
+	if !strings.Contains(stderr, "Summary: paths=2 rewritten=0 would_rewrite=1 skipped_non_regular=0 skipped_hardlinks=1 skipped_sparse=0 failures=0 bytes_rewritten=0") {
 		t.Fatalf("stats summary missing or incorrect: %q", stderr)
 	}
 }
@@ -724,7 +949,7 @@ func TestCLIDedupHardlinksStats(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
-	if !strings.Contains(stderr, "Summary: paths=2 rewritten=1 would_rewrite=0 skipped_non_regular=0 skipped_hardlinks=1 failures=0 bytes_rewritten=3") {
+	if !strings.Contains(stderr, "Summary: paths=2 rewritten=1 would_rewrite=0 skipped_non_regular=0 skipped_hardlinks=1 skipped_sparse=0 failures=0 bytes_rewritten=3") {
 		t.Fatalf("stats summary missing or incorrect: %q", stderr)
 	}
 }
@@ -767,7 +992,7 @@ func TestCLIStatsMixedResults(t *testing.T) {
 	if exitCode != 1 {
 		t.Fatalf("exit code = %d, want 1; stderr=%q", exitCode, stderr)
 	}
-	if !strings.Contains(stderr, "Summary: paths=2 rewritten=1 would_rewrite=0 skipped_non_regular=0 skipped_hardlinks=0 failures=1 bytes_rewritten=3") {
+	if !strings.Contains(stderr, "Summary: paths=2 rewritten=1 would_rewrite=0 skipped_non_regular=0 skipped_hardlinks=0 skipped_sparse=0 failures=1 bytes_rewritten=3") {
 		t.Fatalf("stats summary missing or incorrect: %q", stderr)
 	}
 }
