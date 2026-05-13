@@ -42,6 +42,15 @@ func withReleaseUpdaterStub(t *testing.T, updater releaseUpdater) {
 	})
 }
 
+func withSyncDirPathStub(t *testing.T, fn func(string) error) {
+	t.Helper()
+	previous := syncDirPath
+	syncDirPath = fn
+	t.Cleanup(func() {
+		syncDirPath = previous
+	})
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -101,6 +110,102 @@ func TestCLISelfupdateRunsUpdater(t *testing.T) {
 	}
 }
 
+func TestCLISelfupdateBypassesUnrelatedFlagParsing(t *testing.T) {
+	stub := &stubReleaseUpdater{}
+	withReleaseUpdaterStub(t, stub)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	exitCode := run([]string{"--selfupdate=false", "--unknown-flag", "--selfupdate", "--buffersize=0", "ignored-path"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stub.runCalls != 1 {
+		t.Fatalf("stub updater runCalls = %d, want 1", stub.runCalls)
+	}
+	if !strings.Contains(stdout.String(), "stub updater invoked") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestCLISelfupdateFalseUsesNormalParsing(t *testing.T) {
+	stub := &stubReleaseUpdater{}
+	withReleaseUpdaterStub(t, stub)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	exitCode := run([]string{"--selfupdate=false"}, &stdout, &stderr)
+	if exitCode != 2 {
+		t.Fatalf("exit code = %d, want 2; stderr=%q", exitCode, stderr.String())
+	}
+	if stub.runCalls != 0 {
+		t.Fatalf("stub updater runCalls = %d, want 0", stub.runCalls)
+	}
+	if !strings.Contains(stderr.String(), "Usage of "+appName+":") {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestCLISelfupdateInvalidValueExitsTwo(t *testing.T) {
+	stub := &stubReleaseUpdater{}
+	withReleaseUpdaterStub(t, stub)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	exitCode := run([]string{"--selfupdate=not-a-bool"}, &stdout, &stderr)
+	if exitCode != 2 {
+		t.Fatalf("exit code = %d, want 2; stderr=%q", exitCode, stderr.String())
+	}
+	if stub.runCalls != 0 {
+		t.Fatalf("stub updater runCalls = %d, want 0", stub.runCalls)
+	}
+	if stdout.String() != "" {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), `invalid argument "not-a-bool" for "--selfupdate" flag`) {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestCLISelfupdateAfterEndOfFlagsIsAPath(t *testing.T) {
+	stub := &stubReleaseUpdater{}
+	withReleaseUpdaterStub(t, stub)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "--selfupdate"), []byte("abc"), 0o644); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	originalDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(originalDir); err != nil {
+			t.Fatalf("Chdir cleanup returned error: %v", err)
+		}
+	})
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir returned error: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	exitCode := run([]string{"--dry-run", "--", "--selfupdate"}, &stdout, &stderr)
+	if exitCode != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr.String())
+	}
+	if stub.runCalls != 0 {
+		t.Fatalf("stub updater runCalls = %d, want 0", stub.runCalls)
+	}
+	if stderr.String() != "WOULD REWRITE --selfupdate\n" {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
 func TestCLISelfupdateReportsUpdaterError(t *testing.T) {
 	stub := &stubReleaseUpdater{err: io.EOF}
 	withReleaseUpdaterStub(t, stub)
@@ -125,10 +230,27 @@ func TestGitHubReleaseUpdaterReplacesExecutable(t *testing.T) {
 	if err := os.WriteFile(exePath, []byte("old-binary"), 0o755); err != nil {
 		t.Fatalf("WriteFile returned error: %v", err)
 	}
-	expectedMode := os.FileMode(0o755) | os.ModeSetuid | os.ModeSetgid
-	if err := os.Chmod(exePath, expectedMode); err != nil {
+	requestedMode := os.FileMode(0o755) | os.ModeSetuid | os.ModeSetgid
+	if err := os.Chmod(exePath, requestedMode); err != nil {
 		t.Fatalf("Chmod returned error: %v", err)
 	}
+	initialInfo, err := os.Stat(exePath)
+	if err != nil {
+		t.Fatalf("Stat returned error: %v", err)
+	}
+	expectedMode := replacementExecutableMode(initialInfo.Mode())
+	resolvedExePath, err := filepath.EvalSymlinks(exePath)
+	if err != nil {
+		t.Fatalf("EvalSymlinks returned error: %v", err)
+	}
+	expectedSyncDir := filepath.Dir(resolvedExePath)
+	var syncedDir string
+	var syncDirCalls int
+	withSyncDirPathStub(t, func(path string) error {
+		syncDirCalls++
+		syncedDir = path
+		return nil
+	})
 
 	binaryCandidates, checksumCandidates := releaseAssetCandidates(runtime.GOOS, runtime.GOARCH)
 	binaryName := binaryCandidates[0]
@@ -203,11 +325,82 @@ func TestGitHubReleaseUpdaterReplacesExecutable(t *testing.T) {
 	if metadataCalls != 1 || binaryCalls != 1 || checksumCalls != 1 {
 		t.Fatalf("calls = metadata:%d binary:%d checksum:%d", metadataCalls, binaryCalls, checksumCalls)
 	}
+	if syncDirCalls != 1 {
+		t.Fatalf("syncDirCalls = %d, want 1", syncDirCalls)
+	}
+	if syncedDir != expectedSyncDir {
+		t.Fatalf("syncedDir = %q, want %q", syncedDir, expectedSyncDir)
+	}
 	if !strings.Contains(stdout.String(), "Updating "+appName+" from 1.0.0 to v9.9.9") {
 		t.Fatalf("stdout = %q", stdout.String())
 	}
 	if !strings.Contains(stdout.String(), "Updated "+appName+" to v9.9.9") {
 		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestGitHubReleaseUpdaterReportsDirectorySyncFailure(t *testing.T) {
+	exePath := filepath.Join(t.TempDir(), appName)
+	if err := os.WriteFile(exePath, []byte("old-binary"), 0o755); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	resolvedExePath, err := filepath.EvalSymlinks(exePath)
+	if err != nil {
+		t.Fatalf("EvalSymlinks returned error: %v", err)
+	}
+	expectedSyncDir := filepath.Dir(resolvedExePath)
+	withSyncDirPathStub(t, func(path string) error {
+		if path != expectedSyncDir {
+			t.Fatalf("sync dir path = %q, want %q", path, expectedSyncDir)
+		}
+		return os.ErrPermission
+	})
+
+	binaryName, checksumName := runtimeAssetNames(runtime.GOOS, runtime.GOARCH)
+	binaryBody := []byte("new-binary-content")
+	sum := sha256.Sum256(binaryBody)
+	checksumBody := hex.EncodeToString(sum[:]) + "  " + binaryName + "\n"
+
+	baseURL := "https://example.test"
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/repos/naterator/filerewrite/releases/latest":
+			body, err := json.Marshal(githubRelease{
+				TagName: "v9.9.9",
+				Assets: []githubReleaseAsset{
+					{Name: binaryName, BrowserDownloadURL: baseURL + "/download/" + binaryName},
+					{Name: checksumName, BrowserDownloadURL: baseURL + "/download/" + checksumName},
+				},
+			})
+			if err != nil {
+				t.Fatalf("Marshal returned error: %v", err)
+			}
+			return testResponse(r, http.StatusOK, body), nil
+		case "/download/" + binaryName:
+			return testResponse(r, http.StatusOK, binaryBody), nil
+		case "/download/" + checksumName:
+			return testResponse(r, http.StatusOK, []byte(checksumBody)), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})
+
+	updater := newUpdaterForTest(client, baseURL+"/repos/naterator/filerewrite/releases/latest", exePath, runtime.GOOS, runtime.GOARCH)
+	err = updater.Run(context.Background(), "1.0.0", io.Discard)
+	if err == nil {
+		t.Fatal("Run unexpectedly succeeded")
+	}
+	if !strings.Contains(err.Error(), "flush executable directory after replacement") {
+		t.Fatalf("Run error = %v", err)
+	}
+
+	got, readErr := os.ReadFile(exePath)
+	if readErr != nil {
+		t.Fatalf("ReadFile returned error: %v", readErr)
+	}
+	if string(got) != string(binaryBody) {
+		t.Fatalf("updated executable content = %q, want %q", string(got), string(binaryBody))
 	}
 }
 
@@ -325,6 +518,106 @@ func TestGitHubReleaseUpdaterSkipsNewerThanLatest(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "newer than published release") {
 		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestGitHubReleaseUpdaterTreatsInvalidCurrentVersionAsUnknown(t *testing.T) {
+	exePath := filepath.Join(t.TempDir(), appName)
+	if err := os.WriteFile(exePath, []byte("old-binary"), 0o755); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	withSyncDirPathStub(t, func(path string) error {
+		return nil
+	})
+
+	binaryName, checksumName := runtimeAssetNames(runtime.GOOS, runtime.GOARCH)
+	binaryBody := []byte("new-binary-content")
+	sum := sha256.Sum256(binaryBody)
+	checksumBody := hex.EncodeToString(sum[:]) + "  " + binaryName + "\n"
+
+	var binaryCalls int
+	baseURL := "https://example.test"
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/repos/naterator/filerewrite/releases/latest":
+			body, err := json.Marshal(githubRelease{
+				TagName: "v9.9.9",
+				Assets: []githubReleaseAsset{
+					{Name: binaryName, BrowserDownloadURL: baseURL + "/download/" + binaryName},
+					{Name: checksumName, BrowserDownloadURL: baseURL + "/download/" + checksumName},
+				},
+			})
+			if err != nil {
+				t.Fatalf("Marshal returned error: %v", err)
+			}
+			return testResponse(r, http.StatusOK, body), nil
+		case "/download/" + binaryName:
+			binaryCalls++
+			return testResponse(r, http.StatusOK, binaryBody), nil
+		case "/download/" + checksumName:
+			return testResponse(r, http.StatusOK, []byte(checksumBody)), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})
+
+	updater := newUpdaterForTest(client, baseURL+"/repos/naterator/filerewrite/releases/latest", exePath, runtime.GOOS, runtime.GOARCH)
+	var stdout bytes.Buffer
+	if err := updater.Run(context.Background(), "not-a-version", &stdout); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if binaryCalls != 1 {
+		t.Fatalf("binaryCalls = %d, want 1", binaryCalls)
+	}
+	if !strings.Contains(stdout.String(), "Updating "+appName+" from not-a-version to v9.9.9") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestGitHubReleaseUpdaterRejectsWindowsRuntime(t *testing.T) {
+	binaryName, checksumName := runtimeAssetNames("windows", "amd64")
+	binaryBody := []byte("new-binary-content")
+	sum := sha256.Sum256(binaryBody)
+	checksumBody := hex.EncodeToString(sum[:]) + "  " + binaryName + "\n"
+
+	var binaryCalls int
+	baseURL := "https://example.test"
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/repos/naterator/filerewrite/releases/latest":
+			body, err := json.Marshal(githubRelease{
+				TagName: "v9.9.9",
+				Assets: []githubReleaseAsset{
+					{Name: binaryName, BrowserDownloadURL: baseURL + "/download/" + binaryName},
+					{Name: checksumName, BrowserDownloadURL: baseURL + "/download/" + checksumName},
+				},
+			})
+			if err != nil {
+				t.Fatalf("Marshal returned error: %v", err)
+			}
+			return testResponse(r, http.StatusOK, body), nil
+		case "/download/" + binaryName:
+			binaryCalls++
+			return testResponse(r, http.StatusOK, binaryBody), nil
+		case "/download/" + checksumName:
+			return testResponse(r, http.StatusOK, []byte(checksumBody)), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})
+
+	updater := newUpdaterForTest(client, baseURL+"/repos/naterator/filerewrite/releases/latest", "/unused", "windows", "amd64")
+	err := updater.Run(context.Background(), "1.0.0", io.Discard)
+	if err == nil {
+		t.Fatal("Run unexpectedly succeeded")
+	}
+	if !strings.Contains(err.Error(), "selfupdate is not supported on windows yet") {
+		t.Fatalf("Run error = %v", err)
+	}
+	if binaryCalls != 0 {
+		t.Fatalf("binaryCalls = %d, want 0", binaryCalls)
 	}
 }
 
@@ -542,6 +835,29 @@ func TestGitHubReleaseUpdaterReportsHTTPStatusErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "GET "+baseURL+"/repos/naterator/filerewrite/releases/latest returned 502 Bad Gateway: upstream broke") {
 		t.Fatalf("Run error = %v", err)
+	}
+}
+
+func TestGitHubReleaseUpdaterReportsHTTPStatusErrorsWithBlankBody(t *testing.T) {
+	baseURL := "https://example.test"
+	client := newTestClient(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/repos/naterator/filerewrite/releases/latest":
+			return testResponse(r, http.StatusBadGateway, []byte(" \n\t")), nil
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+			return nil, nil
+		}
+	})
+
+	updater := newUpdaterForTest(client, baseURL+"/repos/naterator/filerewrite/releases/latest", "/unused", runtime.GOOS, runtime.GOARCH)
+	err := updater.Run(context.Background(), "1.0.0", io.Discard)
+	if err == nil {
+		t.Fatal("Run unexpectedly succeeded")
+	}
+	want := "GET " + baseURL + "/repos/naterator/filerewrite/releases/latest returned 502 Bad Gateway"
+	if err.Error() != "fetch latest release metadata: "+want {
+		t.Fatalf("Run error = %v, want %q", err, "fetch latest release metadata: "+want)
 	}
 }
 

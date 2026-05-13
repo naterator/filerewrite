@@ -50,6 +50,7 @@ var (
 	chmodPath      = os.Chmod
 	renamePath     = os.Rename
 	removePath     = os.Remove
+	syncDirPath    = syncDirectory
 )
 
 func newDefaultReleaseUpdater() releaseUpdater {
@@ -228,7 +229,19 @@ func (u *githubReleaseUpdater) downloadAndReplace(ctx context.Context, exePath, 
 		return fmt.Errorf("replace current executable %q: %w", exePath, err)
 	}
 	removeTemp = false
+	if err := syncDirPath(dir); err != nil {
+		return fmt.Errorf("flush executable directory after replacement: %w", err)
+	}
 	return nil
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func (u *githubReleaseUpdater) get(ctx context.Context, url string) (*http.Response, error) {
@@ -254,7 +267,7 @@ func (u *githubReleaseUpdater) get(ctx context.Context, url string) (*http.Respo
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		message := strings.TrimSpace(string(body))
 		if message == "" {
-			message = resp.Status
+			return nil, fmt.Errorf("GET %s returned %s", url, resp.Status)
 		}
 		return nil, fmt.Errorf("GET %s returned %s: %s", url, resp.Status, message)
 	}

@@ -68,8 +68,10 @@ Buffer size must be greater than `0` and small enough to fit in the platform `in
 ## Reporting Modes
 
 - `--dry-run` prints a plain `WOULD REWRITE <path>` line to `stderr` for regular files that would be processed and does not open files for write access.
-- `--dry-run --dedup-hardlinks` prints a plain `WOULD SKIP HARDLINK <path>` line to `stderr` for later paths that reference the same inode as an earlier path in the same invocation.
+- `--dry-run --dedup-hardlinks` prints a plain `WOULD SKIP HARDLINK <path> (same inode as <path>)` line to `stderr` for later paths that reference the same inode as an earlier path in the same invocation.
 - `--dry-run --skip-sparse` prints a plain `WOULD SKIP SPARSE <path>` line to `stderr` for files that would be skipped by the sparse-file guardrail.
+- `--dedup-hardlinks` prints a plain `SKIP HARDLINK <path> (same inode as <path>)` line to `stderr` for later paths that reference the same inode as an earlier path in the same invocation.
+- `--skip-sparse` prints a plain `SKIP SPARSE <path>` line to `stderr` for files skipped by the sparse-file guardrail.
 - `--stats` prints a plain summary line to `stderr`:
   ```
   Summary: paths=5 rewritten=4 would_rewrite=0 skipped_non_regular=0 skipped_hardlinks=1 skipped_sparse=0 failures=0 bytes_rewritten=10485760

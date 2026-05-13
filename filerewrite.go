@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 	"syscall"
 
 	flag "github.com/spf13/pflag"
@@ -324,7 +326,7 @@ func processPath(path string, options processOptions, seen map[hardLinkKey]strin
 
 	if options.dedupHardlinks {
 		if firstPath, duplicate := trackHardLink(path, &openSB, seen); duplicate {
-			logVerbose("Skipping hard-link duplicate %s (same inode as %s).", path, firstPath)
+			logInfo("SKIP HARDLINK %s (same inode as %s)", path, firstPath)
 			return closeProcessedFile(fd, path, pathResult{path: path, outcome: pathOutcomeSkippedHardlink})
 		}
 	}
@@ -370,6 +372,28 @@ func (stats runStats) summaryLine() string {
 
 func rewriteFile(path string, bufferSizeBytes int) bool {
 	return processPath(path, processOptions{bufferSizeBytes: bufferSizeBytes}, nil).outcome == pathOutcomeRewritten
+}
+
+func selfupdateRequested(args []string) (bool, error) {
+	requested := false
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		if arg == "--selfupdate" {
+			requested = true
+			continue
+		}
+		if value, ok := strings.CutPrefix(arg, "--selfupdate="); ok {
+			enabled, err := strconv.ParseBool(value)
+			if err != nil {
+				return false, fmt.Errorf("invalid argument %q for %q flag: %w", value, "--selfupdate", err)
+			}
+			requested = enabled
+		}
+	}
+
+	return requested, nil
 }
 
 func newFlagSet(stderr io.Writer) (*flag.FlagSet, *cliOptions) {
@@ -421,6 +445,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	infoOutput = stderr
 	errorOutput = stderr
+
+	requestSelfupdate, err := selfupdateRequested(args)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if requestSelfupdate {
+		if err := makeReleaseUpdater().Run(context.Background(), appVersion, stdout); err != nil {
+			_, _ = fmt.Fprintf(stderr, "selfupdate failed: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 
 	fs, cli := newFlagSet(stderr)
 

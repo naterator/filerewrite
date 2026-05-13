@@ -949,6 +949,9 @@ func TestCLIDedupHardlinksStats(t *testing.T) {
 	if exitCode != 0 {
 		t.Fatalf("exit code = %d, want 0; stderr=%q", exitCode, stderr)
 	}
+	if !strings.Contains(stderr, "SKIP HARDLINK "+duplicatePath+" (same inode as "+primaryPath+")") {
+		t.Fatalf("hard-link skip output missing: %q", stderr)
+	}
 	if !strings.Contains(stderr, "Summary: paths=2 rewritten=1 would_rewrite=0 skipped_non_regular=0 skipped_hardlinks=1 skipped_sparse=0 failures=0 bytes_rewritten=3") {
 		t.Fatalf("stats summary missing or incorrect: %q", stderr)
 	}
